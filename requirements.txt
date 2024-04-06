@@ -1,0 +1,8 @@
+google
+google-cloud-aiplatform
+ratelimit~=2.2.1
+backoff~=2.2.1
+pprintpp
+pandas~=2.2.1
+tqdm~=4.66.2
+vertexai~=1.46.0
