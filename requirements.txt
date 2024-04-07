@@ -6,3 +6,8 @@ pprintpp
 pandas~=2.2.1
 tqdm~=4.66.2
 vertexai~=1.46.0
+# for huggingface
+transformers
+torch
+SentencePiece
+nltk
