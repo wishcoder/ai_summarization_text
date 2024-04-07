@@ -20,6 +20,7 @@ Google's current policy restricts downloading foundational models like Gemini fo
 > While downloading pre-trained models isn't feasible, you could consider training a custom model based on Google's open-source TensorFlow libraries. This approach would require expertise in TensorFlow and potentially significant training time depending on the amount of data you have. However, the resulting model would reside entirely within your GCP project and wouldn't require sending data externally.
  
 ### Pros and cons of each approach
+> [!TIP]
 >
 >| Approach                         | Pros                                           | Cons                                                                                   |
 >|----------------------------------|------------------------------------------------|----------------------------------------------------------------------------------------|
