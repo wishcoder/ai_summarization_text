@@ -11,7 +11,7 @@ Summarization large text using Vertex AI Language Models 'text-bison@001'
 ## Google Foundational Models
 Google's current policy restricts downloading foundational models like Gemini for on-premise deployment. These models are highly complex and require significant computational resources to run effectively.  However, there are alternative solutions you can explore within GCP that adhere to your company's security policies:
 
-### Vertex AI Private Endpoints
+### [Vertex AI](https://cloud.google.com/vertex-ai/docs) Private Endpoints
 > [!TIP]
 > Vertex AI offers the option to deploy models within a Virtual Private Cloud (VPC) environment. This allows you to access the model without any data leaving your network. You can configure a Private Endpoint for your Gemini model within your VPC. Refer to the [Vertex AI documentation on Private Endpoints](https://cloud.google.com/vertex-ai/docs/predictions/using-private-endpoints) for details on setup.
 
