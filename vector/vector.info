@@ -1,0 +1,466 @@
+============ SQL ============
+-- Location: us-central1
+-- Params: @q ARRAY<FLOAT64>, @topK INT64, @threshold FLOAT64 (nullable)
+
+WITH query_vec AS (SELECT @q AS emb),
+
+-- ----------- Incidents: error / solution -----------
+inc_union AS (
+  SELECT 'TableIncidents' AS source_table, base.incId AS id, base.incName AS name, distance, base
+  FROM VECTOR_SEARCH(
+    TABLE `myproj.mydata.TableIncidents`,
+    'embedding_error',
+    (SELECT emb FROM query_vec), 'emb',
+    top_k => @topK, distance_type => 'COSINE', options => '{}'
+  )
+  UNION ALL
+  SELECT 'TableIncidents', base.incId, base.incName, distance, base
+  FROM VECTOR_SEARCH(
+    TABLE `myproj.mydata.TableIncidents`,
+    'embedding_solution',
+    (SELECT emb FROM query_vec), 'emb',
+    top_k => @topK, distance_type => 'COSINE', options => '{}'
+  )
+),
+inc_best AS (
+  SELECT source_table, id, name, MIN(distance) AS best_distance
+  FROM inc_union
+  GROUP BY source_table, id, name
+),
+inc_joined AS (
+  SELECT
+    b.source_table,
+    b.id,
+    b.name,
+    STRUCT(
+      i.* EXCEPT (embedding_error, embedding_solution),
+      it.embedding_error_text     AS error_text,
+      it.embedding_solution_text  AS solution_text
+    ) AS base,
+    LEAST(GREATEST(1.0 - b.best_distance, 0.0), 1.0) AS score
+  FROM inc_best b
+  JOIN `myproj.mydata.TableIncidents` i
+    ON i.incId = b.id
+  LEFT JOIN `myproj.mydata.TableIncidentsText` it
+    ON it.incId = b.id
+),
+
+-- ----------- IRequests: description / notes -----------
+req_union AS (
+  SELECT 'TableIRequests', base.reqId, base.reqName, distance, base
+  FROM VECTOR_SEARCH(
+    TABLE `myproj.mydata.TableIRequests`,
+    'embedding_description',
+    (SELECT emb FROM query_vec), 'emb',
+    top_k => @topK, distance_type => 'COSINE', options => '{}'
+  )
+  UNION ALL
+  SELECT 'TableIRequests', base.reqId, base.reqName, distance, base
+  FROM VECTOR_SEARCH(
+    TABLE `myproj.mydata.TableIRequests`,
+    'embedding_notes',
+    (SELECT emb FROM query_vec), 'emb',
+    top_k => @topK, distance_type => 'COSINE', options => '{}'
+  )
+),
+req_best AS (
+  SELECT source_table, id, name, MIN(distance) AS best_distance
+  FROM req_union
+  GROUP BY source_table, id, name
+),
+req_joined AS (
+  SELECT
+    b.source_table,
+    b.id,
+    b.name,
+    STRUCT(
+      r.* EXCEPT (embedding_description, embedding_notes),
+      rt.embedding_description_text AS description_text,
+      rt.embedding_notes_text       AS notes_text
+    ) AS base,
+    LEAST(GREATEST(1.0 - b.best_distance, 0.0), 1.0) AS score
+  FROM req_best b
+  JOIN `myproj.mydata.TableIRequests` r
+    ON r.reqId = b.id
+  LEFT JOIN `myproj.mydata.TableIRequestsText` rt
+    ON rt.reqId = b.id
+),
+
+-- ----------- Confluence: data / contacts -----------
+conf_union AS (
+  SELECT 'TableConfluence', base.idConfluence, base.nameConfluence, distance, base
+  FROM VECTOR_SEARCH(
+    TABLE `myproj.mydata.TableConfluence`,
+    'embedding_confluence_data',
+    (SELECT emb FROM query_vec), 'emb',
+    top_k => @topK, distance_type => 'COSINE', options => '{}'
+  )
+  UNION ALL
+  SELECT 'TableConfluence', base.idConfluence, base.nameConfluence, distance, base
+  FROM VECTOR_SEARCH(
+    TABLE `myproj.mydata.TableConfluence`,
+    'embedding_confluence_contacts',
+    (SELECT emb FROM query_vec), 'emb',
+    top_k => @topK, distance_type => 'COSINE', options => '{}'
+  )
+),
+conf_best AS (
+  SELECT source_table, id, name, MIN(distance) AS best_distance
+  FROM conf_union
+  GROUP BY source_table, id, name
+),
+conf_joined AS (
+  SELECT
+    b.source_table,
+    b.id,
+    b.name,
+    STRUCT(
+      c.* EXCEPT (embedding_confluence_data, embedding_confluence_contacts),
+      ct.embedding_confluence_data_text     AS confluence_data_text,
+      ct.embedding_confluence_contacts_text AS confluence_contacts_text
+    ) AS base,
+    LEAST(GREATEST(1.0 - b.best_distance, 0.0), 1.0) AS score
+  FROM conf_best b
+  JOIN `myproj.mydata.TableConfluence` c
+    ON c.idConfluence = b.id
+  LEFT JOIN `myproj.mydata.TableConfluenceText` ct
+    ON ct.idConfluence = b.id
+),
+
+-- ----------- Merge, filter, order -----------
+all_scored AS (
+  SELECT * FROM inc_joined
+  UNION ALL SELECT * FROM req_joined
+  UNION ALL SELECT * FROM conf_joined
+)
+SELECT
+  source_table,
+  id,
+  name,
+  base,
+  TO_JSON(base) AS base_json,
+  score
+FROM all_scored
+WHERE @threshold IS NULL OR score >= @threshold
+ORDER BY score DESC
+LIMIT @topK;
+
+
+============ Java ============
+
+// Request from UI
+public record SemanticSearchRequest(
+    String text,
+    Integer topK,
+    Double scoreThreshold
+) {}
+
+// Response items
+public record SearchResultItem(
+    String sourceTable,
+    String id,
+    String name,
+    double score,               // 0..1
+    String summary,             // ends with "(score: 0.###)"
+    Map<String, Object> fields  // all non-embedding cols incl. *_text from *Text tables
+) {}
+
+public record SemanticSearchResponse(
+    List<SearchResultItem> results
+) {}
+
+-----------------------------------------------------------------
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.cloud.bigquery.*;
+import org.springframework.ai.embedding.Embedding;
+import org.springframework.ai.embedding.EmbeddingModel;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.messages.SystemMessage;
+import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.ai.chat.model.ChatResponse;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Service
+public class SemanticSearchService {
+
+    private final EmbeddingModel embeddingModel;
+    private final BigQuery bigQuery;
+    private final ChatClient chatClient;
+    private final ObjectMapper om = new ObjectMapper();
+
+    public SemanticSearchService(EmbeddingModel embeddingModel,
+                                 BigQuery bigQuery,
+                                 ChatClient chatClient) {
+        this.embeddingModel = embeddingModel;
+        this.bigQuery = bigQuery;
+        this.chatClient = chatClient;
+    }
+
+    public SemanticSearchResponse searchAndSummarize(SemanticSearchRequest req) {
+        String text = Objects.requireNonNullElse(req.text(), "").trim();
+        if (!StringUtils.hasText(text)) {
+            return new SemanticSearchResponse(List.of());
+        }
+
+        // 1) Embed query text and L2-normalize (your stored vectors are normalized)
+        List<Double> vec = embed(text);
+        List<Double> q = l2normalize(vec);
+
+        int topK = req.topK() != null ? req.topK() : 10;
+        Double threshold = req.scoreThreshold(); // nullable
+
+        // 2) Run BigQuery
+        TableResult rows = runBigQuery(q, topK, threshold);
+
+        // 3) Build results with per-row summarization
+        List<SearchResultItem> items = new ArrayList<>();
+        for (FieldValueList row : rows.iterateAll()) {
+            String sourceTable = row.get("source_table").getStringValue();
+            String id = row.get("id").getStringValue();
+            String name = row.get("name").isNull() ? "" : row.get("name").getStringValue();
+            double score = row.get("score").getDoubleValue();
+            Map<String, Object> fields = parseBaseJson(row.get("base_json").getStringValue());
+
+            String summary = summarize(sourceTable, id, name, fields)
+                    + String.format(" (score: %.3f)", score);
+
+            items.add(new SearchResultItem(sourceTable, id, name, score, summary, fields));
+        }
+        return new SemanticSearchResponse(items);
+    }
+
+    private List<Double> embed(String text) {
+        List<Embedding> res = embeddingModel.embed(List.of(text)).getResults();
+        if (res.isEmpty()) throw new IllegalStateException("No embedding returned");
+        return res.get(0).getOutput();
+    }
+
+    private static List<Double> l2normalize(List<Double> v) {
+        double n = Math.sqrt(v.stream().mapToDouble(x -> x*x).sum());
+        if (n == 0) return v;
+        return v.stream().map(x -> x / n).collect(Collectors.toList());
+    }
+
+    private TableResult runBigQuery(List<Double> q, int topK, Double threshold) {
+        String sql = """
+            WITH query_vec AS (SELECT @q AS emb),
+            inc_union AS (
+              SELECT 'TableIncidents' AS source_table, base.incId AS id, base.incName AS name, distance, base
+              FROM VECTOR_SEARCH(TABLE `myproj.mydata.TableIncidents`, 'embedding_error',
+                                 (SELECT emb FROM query_vec), 'emb',
+                                 top_k => @topK, distance_type => 'COSINE', options => '{}')
+              UNION ALL
+              SELECT 'TableIncidents', base.incId, base.incName, distance, base
+              FROM VECTOR_SEARCH(TABLE `myproj.mydata.TableIncidents`, 'embedding_solution',
+                                 (SELECT emb FROM query_vec), 'emb',
+                                 top_k => @topK, distance_type => 'COSINE', options => '{}')
+            ),
+            inc_best AS (
+              SELECT source_table, id, name, MIN(distance) AS best_distance
+              FROM inc_union GROUP BY source_table, id, name
+            ),
+            inc_joined AS (
+              SELECT b.source_table, b.id, b.name,
+                     STRUCT(i.* EXCEPT (embedding_error, embedding_solution),
+                            it.embedding_error_text AS error_text,
+                            it.embedding_solution_text AS solution_text) AS base,
+                     LEAST(GREATEST(1.0 - b.best_distance, 0.0), 1.0) AS score
+              FROM inc_best b
+              JOIN `myproj.mydata.TableIncidents` i ON i.incId = b.id
+              LEFT JOIN `myproj.mydata.TableIncidentsText` it ON it.incId = b.id
+            ),
+            req_union AS (
+              SELECT 'TableIRequests', base.reqId, base.reqName, distance, base
+              FROM VECTOR_SEARCH(TABLE `myproj.mydata.TableIRequests`, 'embedding_description',
+                                 (SELECT emb FROM query_vec), 'emb',
+                                 top_k => @topK, distance_type => 'COSINE', options => '{}')
+              UNION ALL
+              SELECT 'TableIRequests', base.reqId, base.reqName, distance, base
+              FROM VECTOR_SEARCH(TABLE `myproj.mydata.TableIRequests`, 'embedding_notes',
+                                 (SELECT emb FROM query_vec), 'emb',
+                                 top_k => @topK, distance_type => 'COSINE', options => '{}')
+            ),
+            req_best AS (
+              SELECT source_table, id, name, MIN(distance) AS best_distance
+              FROM req_union GROUP BY source_table, id, name
+            ),
+            req_joined AS (
+              SELECT b.source_table, b.id, b.name,
+                     STRUCT(r.* EXCEPT (embedding_description, embedding_notes),
+                            rt.embedding_description_text AS description_text,
+                            rt.embedding_notes_text AS notes_text) AS base,
+                     LEAST(GREATEST(1.0 - b.best_distance, 0.0), 1.0) AS score
+              FROM req_best b
+              JOIN `myproj.mydata.TableIRequests` r ON r.reqId = b.id
+              LEFT JOIN `myproj.mydata.TableIRequestsText` rt ON rt.reqId = b.id
+            ),
+            conf_union AS (
+              SELECT 'TableConfluence', base.idConfluence, base.nameConfluence, distance, base
+              FROM VECTOR_SEARCH(TABLE `myproj.mydata.TableConfluence`, 'embedding_confluence_data',
+                                 (SELECT emb FROM query_vec), 'emb',
+                                 top_k => @topK, distance_type => 'COSINE', options => '{}')
+              UNION ALL
+              SELECT 'TableConfluence', base.idConfluence, base.nameConfluence, distance, base
+              FROM VECTOR_SEARCH(TABLE `myproj.mydata.TableConfluence`, 'embedding_confluence_contacts',
+                                 (SELECT emb FROM query_vec), 'emb',
+                                 top_k => @topK, distance_type => 'COSINE', options => '{}')
+            ),
+            conf_best AS (
+              SELECT source_table, id, name, MIN(distance) AS best_distance
+              FROM conf_union GROUP BY source_table, id, name
+            ),
+            conf_joined AS (
+              SELECT b.source_table, b.id, b.name,
+                     STRUCT(c.* EXCEPT (embedding_confluence_data, embedding_confluence_contacts),
+                            ct.embedding_confluence_data_text AS confluence_data_text,
+                            ct.embedding_confluence_contacts_text AS confluence_contacts_text) AS base,
+                     LEAST(GREATEST(1.0 - b.best_distance, 0.0), 1.0) AS score
+              FROM conf_best b
+              JOIN `myproj.mydata.TableConfluence` c ON c.idConfluence = b.id
+              LEFT JOIN `myproj.mydata.TableConfluenceText` ct ON ct.idConfluence = b.id
+            ),
+            all_scored AS (
+              SELECT * FROM inc_joined
+              UNION ALL SELECT * FROM req_joined
+              UNION ALL SELECT * FROM conf_joined
+            )
+            SELECT source_table, id, name, base, TO_JSON(base) AS base_json, score
+            FROM all_scored
+            WHERE @threshold IS NULL OR score >= @threshold
+            ORDER BY score DESC
+            LIMIT @topK
+            """;
+
+        QueryJobConfiguration qjc = QueryJobConfiguration.newBuilder(sql)
+            .setUseLegacySql(false)
+            .setNamedParameters(Map.of(
+                "q", QueryParameterValue.array(q.toArray(new Double[0]), StandardSQLTypeName.FLOAT64),
+                "topK", QueryParameterValue.int64(topK),
+                "threshold", threshold == null
+                    ? QueryParameterValue.nullOf(StandardSQLTypeName.FLOAT64)
+                    : QueryParameterValue.float64(threshold)
+            ))
+            .setPriority(QueryJobConfiguration.Priority.INTERACTIVE)
+            .build();
+
+        // Ensure the job runs in the same location as your dataset(s): us-central1
+        JobId jobId = JobId.newBuilder().setLocation("us-central1").build();
+        Job job = bigQuery.create(JobInfo.newBuilder(qjc).setJobId(jobId).build());
+
+        try {
+            job = job.waitFor();
+            if (job == null) throw new RuntimeException("Job disappeared");
+            if (job.getStatus().getError() != null) {
+                throw new RuntimeException(job.getStatus().getError().toString());
+            }
+            return job.getQueryResults();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(e);
+        }
+    }
+
+    private Map<String, Object> parseBaseJson(String json) {
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> m = om.readValue(json, Map.class);
+            // Drop embedding arrays if any slipped through (we kept them out with EXCEPT)
+            m.remove("embedding_error");
+            m.remove("embedding_solution");
+            m.remove("embedding_description");
+            m.remove("embedding_notes");
+            m.remove("embedding_confluence_data");
+            m.remove("embedding_confluence_contacts");
+            return m;
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse base_json", e);
+        }
+    }
+
+    private String summarize(String sourceTable, String id, String name, Map<String, Object> fields) {
+        // Prefer *_text from *Text tables; include a fallback to names
+        List<String> preferred = switch (sourceTable) {
+            case "TableIncidents"  -> List.of("error_text", "solution_text", "incName");
+            case "TableIRequests"  -> List.of("description_text", "notes_text", "reqName");
+            case "TableConfluence" -> List.of("confluence_data_text", "confluence_contacts_text", "nameConfluence");
+            default -> List.of();
+        };
+        StringBuilder content = new StringBuilder();
+        for (String k : preferred) {
+            Object v = fields.get(k);
+            if (v instanceof String s && !s.isBlank()) {
+                content.append(k).append(": ").append(s.length() > 4000 ? s.substring(0, 4000) + "…" : s).append("\n");
+            }
+        }
+        if (content.length() == 0) content.append(fields);
+
+        String system = """
+            You are a concise summarizer for incidents/requests/confluence notes.
+            Write 1–2 sentences, factual, no speculation. Include identifiers when helpful.
+            """;
+        String user = "Source=%s, id=%s, name=%s\n\nContent:\n%s".formatted(sourceTable, id, name, content);
+
+        ChatResponse r = chatClient
+            .prompt(new SystemMessage(system))
+            .prompt(new UserMessage(user))
+            .call();
+
+        return r.content();
+    }
+}
+
+---------------------------------------------------
+
+private Object toJava(FieldValue v, Field f) {
+        if (v.isNull()) return null;
+        switch (f.getType().getStandardType()) {
+            case STRING: return v.getStringValue();
+            case BOOL:   return v.getBooleanValue();
+            case INT64:  return v.getLongValue();
+            case FLOAT64:return v.getDoubleValue();
+            case NUMERIC:return v.getNumericValue();
+            case JSON:   return v.getStringValue();
+            case TIMESTAMP: return v.getTimestampInstant().toString();
+            case RECORD:
+                Map<String, Object> m = new LinkedHashMap<>();
+                FieldList subs = f.getSubFields();
+                FieldValueList rec = v.getRecordValue();
+                for (int i = 0; i < subs.size(); i++) {
+                    m.put(subs.get(i).getName(), toJava(rec.get(i), subs.get(i)));
+                }
+                return m;
+            case ARRAY:
+                List<Object> arr = new ArrayList<>();
+                Field elem = Field.of(f.getName()+"_elem", f.getType().getArrayElementType());
+                for (FieldValue ev : v.getRepeatedValue()) {
+                    arr.add(toJava(ev, elem));
+                }
+                return arr;
+            default:
+                return v.getStringValue();
+        }
+    }
+
+---------------------------------------------------    
+
+ // Turn a RECORD into a Map and drop all fields whose top-level name starts with "embedding_"
+    private Map<String, Object> toMapDroppingEmbeddings(FieldValue base, FieldList subFields) {
+        FieldValueList list = base.getRecordValue();
+        Map<String, Object> out = new LinkedHashMap<>();
+        for (int i = 0; i < subFields.size(); i++) {
+            Field f = subFields.get(i);
+            String name = f.getName();
+            if (name.startsWith("embedding_")) continue; // drop embeddings
+            FieldValue v = list.get(i);
+            out.put(name, toJava(v, f));
+        }
+        return out;
+    }
+
+---------------------------------------------------    
+
