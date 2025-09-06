@@ -62,6 +62,7 @@
       />
       <v-sheet class="px-3 py-2" elevation="0">
         <v-text-field
+          ref="inputRef"
           v-model="draft"
           variant="outlined"
           density="comfortable"
@@ -113,40 +114,25 @@ export default defineComponent({
     const draft = ref<string>('');
     const busy = ref<boolean>(false);
     const scrollAreaRef: Ref<HTMLElement | null> = ref(null);
-
+    const inputRef = ref<any | null>(null);   
+    
     const canSend = computed<boolean>(() => draft.value.trim().length > 0 && !busy.value);
 
-    // --- Helpers ---
-    function uid(): string {
-      return Math.random().toString(36).slice(2, 9);
+    function focusInput() {
+      // Vuetify v-text-field exposes a focus() method
+      inputRef.value?.focus?.();
+      // Fallback if needed:
+      if (!inputRef.value?.focus) {
+        const el: HTMLInputElement | null = inputRef.value?.$el?.querySelector('input');
+        el?.focus();
+      }
     }
 
-    function parseAnchorSegments(htmlish: string): Segment[] {
-      const container = document.createElement('div');
-      container.innerHTML = htmlish;
-
-      const result: Segment[] = [];
-
-      function walk(node: ChildNode) {
-        if (node.nodeType === Node.TEXT_NODE) {
-          const text = node.textContent ?? '';
-          if (text) result.push({ type: 'text', text });
-          return;
-        }
-        if (node.nodeType === Node.ELEMENT_NODE) {
-          const el = node as HTMLElement;
-          if (el.tagName.toLowerCase() === 'a') {
-            const href = el.getAttribute('href') || '';
-            const text = el.textContent?.trim() || href || 'link';
-            result.push({ type: 'link', text, href });
-            return;
-          }
-          Array.from(node.childNodes).forEach(walk);
-        }
-      }
-
-      Array.from(container.childNodes).forEach(walk);
-      return result.length ? result : [{ type: 'text', text: htmlish }];
+    function scrollToBottomSoon() {
+      nextTick(() => {
+        const el = scrollAreaRef.value;
+        if (el) el.scrollTop = el.scrollHeight;
+      });
     }
 
     function appendMessage(sender: Sender, raw: string) {
@@ -156,24 +142,31 @@ export default defineComponent({
         raw,
         segments: parseAnchorSegments(raw),
       });
-      nextTick(() => {
-        const el = scrollAreaRef.value;
-        if (el) el.scrollTop = el.scrollHeight;
-      });
+      scrollToBottomSoon();
     }
 
     function updateResult(response: string) {
       appendMessage('bot', response);
+      // Ensure the new bot message is visible, then refocus the input
+      nextTick(() => {
+        scrollToBottomSoon();
+        focusInput();              // << focus back to input after response renders
+      });
     }
 
     async function trySend() {
       if (!canSend.value) return;
+
       const text = draft.value.trim();
       draft.value = '';
-
       appendMessage('user', text);
 
       busy.value = true;
+
+      // Wait one tick so the "Thinking…" bubble renders, then scroll to it
+      await nextTick();
+      scrollToBottomSoon();        // << shows the busy indicator at the bottom
+
       try {
         const response = await sendQuery(text);
         updateResult(response);
@@ -183,12 +176,16 @@ export default defineComponent({
         console.error(err);
       } finally {
         busy.value = false;
+        // Extra safety: refocus even if something short-circuited
+        focusInput();
       }
     }
 
     function onLinkClick(href: string) {
       processChatAction(href);
+      focusInput();                // optional UX nicety after clicking a link
     }
+
 
     return {
       messages,
@@ -198,6 +195,7 @@ export default defineComponent({
       canSend,
       trySend,
       onLinkClick,
+      inputRef
     };
   },
 });
