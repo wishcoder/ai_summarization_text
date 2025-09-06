@@ -90,7 +90,7 @@
 </template>
 
 <script lang="ts">
-import { defineComponent, ref, computed, nextTick, type Ref } from 'vue';
+import { defineComponent, ref, computed, nextTick, type Ref, watch  } from 'vue';
 import { sendQuery, processChatAction } from './Chat';
 
 type Sender = 'user' | 'bot';
@@ -107,7 +107,7 @@ interface ChatMessage {
 }
 
 export default defineComponent({
-  name: 'AssistChat',
+  name: 'Chat',
   setup() {
     // --- State ---
     const messages = ref<ChatMessage[]>([]);
@@ -128,12 +128,18 @@ export default defineComponent({
       }
     }
 
-    function scrollToBottomSoon() {
-      nextTick(() => {
-        const el = scrollAreaRef.value;
-        if (el) el.scrollTop = el.scrollHeight;
-      });
-    }
+    async function scrollToBottom(opts: { smooth?: boolean } = {}) {
+  const { smooth = false } = opts;
+  await nextTick();                    
+  await new Promise(requestAnimationFrame); 
+  const el = scrollAreaRef.value;
+  if (!el) return;
+
+  el.scrollTo({
+    top: el.scrollHeight,
+    behavior: smooth ? 'smooth' : 'auto',
+  });
+}
 
     function appendMessage(sender: Sender, raw: string) {
       messages.value.push({
@@ -142,15 +148,15 @@ export default defineComponent({
         raw,
         segments: parseAnchorSegments(raw),
       });
-      scrollToBottomSoon();
+      scrollToBottom({ smooth: sender === 'user' });
     }
 
     function updateResult(response: string) {
       appendMessage('bot', response);
       // Ensure the new bot message is visible, then refocus the input
       nextTick(() => {
-        scrollToBottomSoon();
-        focusInput();              // << focus back to input after response renders
+        scrollToBottom({ smooth: true });
+        focusInput();
       });
     }
 
@@ -165,7 +171,7 @@ export default defineComponent({
 
       // Wait one tick so the "Thinking…" bubble renders, then scroll to it
       await nextTick();
-      scrollToBottomSoon();        // << shows the busy indicator at the bottom
+      await scrollToBottom();
 
       try {
         const response = await sendQuery(text);
@@ -186,7 +192,11 @@ export default defineComponent({
       focusInput();                // optional UX nicety after clicking a link
     }
 
-
+watch(
+  () => messages.value.length,
+  () => scrollToBottom(),
+);
+    
     return {
       messages,
       draft,
@@ -221,6 +231,7 @@ export default defineComponent({
   /* already flex-grow-1 via class, keep for clarity: */
   flex: 1 1 auto;
   overflow: auto;
+  min-height: 0;
 }
 
 /* Sticky input at the bottom of the view */
