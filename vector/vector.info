@@ -1,3 +1,208 @@
+============ SQL TVF ============
+
+-- Location: us-central1
+-- Creates a table-valued function you can call like:
+-- SELECT * FROM `myproj.mydata.semantic_search_all`(q => <ARRAY<FLOAT64>>, topK => 30, threshold => 0.7,
+--                                                   search_incidents => TRUE, search_requests => TRUE, search_confluence => TRUE);
+
+CREATE OR REPLACE FUNCTION `myproj.mydata.semantic_search_all`(
+  q ARRAY<FLOAT64>,         -- 768-D query embedding (L2-normalized in Java to match stored vectors)
+  topK INT64,               -- per-branch top_k (applied inside each VECTOR_SEARCH)
+  threshold FLOAT64,        -- nullable; set NULL to disable score filtering
+  search_incidents BOOL,    -- toggle Incidents
+  search_requests BOOL,     -- toggle IRequests
+  search_confluence BOOL    -- toggle Confluence
+)
+RETURNS TABLE<
+  source_table STRING,
+  id           STRING,
+  name         STRING,
+  score        FLOAT64,
+  base         STRUCT<
+    -- Unioned "base" schema so the TVF has a stable result type across all three sources.
+    -- For rows that don't use a field, it will be NULL.
+    incId                      STRING,
+    incName                    STRING,
+    reqId                      STRING,
+    reqName                    STRING,
+    idConfluence               STRING,
+    nameConfluence             STRING,
+    -- Paired *Text table fields (for summarization)
+    error_text                 STRING,
+    solution_text              STRING,
+    description_text           STRING,
+    notes_text                 STRING,
+    confluence_data_text       STRING,
+    confluence_contacts_text   STRING
+  >
+)
+AS (
+  WITH query_vec AS (SELECT q AS emb),
+
+  -- ================== Incidents (embedding_error / embedding_solution) ==================
+  inc_union AS (
+    SELECT 'TableIncidents' AS source_table, base.incId AS id, base.incName AS name, distance, base
+    FROM VECTOR_SEARCH(
+      TABLE `myproj.mydata.TableIncidents`,
+      'embedding_error',
+      (SELECT emb FROM query_vec), 'emb',
+      top_k => topK, distance_type => 'COSINE', options => '{}'
+    )
+    UNION ALL
+    SELECT 'TableIncidents', base.incId, base.incName, distance, base
+    FROM VECTOR_SEARCH(
+      TABLE `myproj.mydata.TableIncidents`,
+      'embedding_solution',
+      (SELECT emb FROM query_vec), 'emb',
+      top_k => topK, distance_type => 'COSINE', options => '{}'
+    )
+  ),
+  inc_best AS (
+    SELECT source_table, id, name, MIN(distance) AS best_distance
+    FROM inc_union
+    GROUP BY source_table, id, name
+  ),
+  inc_joined AS (
+    SELECT
+      b.source_table,
+      b.id,
+      b.name,
+      -- Build the unioned STRUCT explicitly so schemas match across UNION ALL later.
+      STRUCT(
+        i.incId,
+        i.incName,
+        CAST(NULL AS STRING) AS reqId,
+        CAST(NULL AS STRING) AS reqName,
+        CAST(NULL AS STRING) AS idConfluence,
+        CAST(NULL AS STRING) AS nameConfluence,
+        it.embedding_error_text,
+        it.embedding_solution_text,
+        CAST(NULL AS STRING) AS description_text,
+        CAST(NULL AS STRING) AS notes_text,
+        CAST(NULL AS STRING) AS confluence_data_text,
+        CAST(NULL AS STRING) AS confluence_contacts_text
+      ) AS base,
+      LEAST(GREATEST(1.0 - b.best_distance, 0.0), 1.0) AS score
+    FROM inc_best b
+    JOIN `myproj.mydata.TableIncidents` i
+      ON i.incId = b.id
+    LEFT JOIN `myproj.mydata.TableIncidentsText` it
+      ON it.incId = b.id
+  ),
+
+  -- ================== IRequests (embedding_description / embedding_notes) ==================
+  req_union AS (
+    SELECT 'TableIRequests', base.reqId, base.reqName, distance, base
+    FROM VECTOR_SEARCH(
+      TABLE `myproj.mydata.TableIRequests`,
+      'embedding_description',
+      (SELECT emb FROM query_vec), 'emb',
+      top_k => topK, distance_type => 'COSINE', options => '{}'
+    )
+    UNION ALL
+    SELECT 'TableIRequests', base.reqId, base.reqName, distance, base
+    FROM VECTOR_SEARCH(
+      TABLE `myproj.mydata.TableIRequests`,
+      'embedding_notes',
+      (SELECT emb FROM query_vec), 'emb',
+      top_k => topK, distance_type => 'COSINE', options => '{}'
+    )
+  ),
+  req_best AS (
+    SELECT source_table, id, name, MIN(distance) AS best_distance
+    FROM req_union
+    GROUP BY source_table, id, name
+  ),
+  req_joined AS (
+    SELECT
+      b.source_table,
+      b.id,
+      b.name,
+      STRUCT(
+        CAST(NULL AS STRING) AS incId,
+        CAST(NULL AS STRING) AS incName,
+        r.reqId,
+        r.reqName,
+        CAST(NULL AS STRING) AS idConfluence,
+        CAST(NULL AS STRING) AS nameConfluence,
+        CAST(NULL AS STRING) AS error_text,
+        CAST(NULL AS STRING) AS solution_text,
+        rt.embedding_description_text,
+        rt.embedding_notes_text,
+        CAST(NULL AS STRING) AS confluence_data_text,
+        CAST(NULL AS STRING) AS confluence_contacts_text
+      ) AS base,
+      LEAST(GREATEST(1.0 - b.best_distance, 0.0), 1.0) AS score
+    FROM req_best b
+    JOIN `myproj.mydata.TableIRequests` r
+      ON r.reqId = b.id
+    LEFT JOIN `myproj.mydata.TableIRequestsText` rt
+      ON rt.reqId = b.id
+  ),
+
+  -- ================== Confluence (embedding_confluence_data / embedding_confluence_contacts) ==================
+  conf_union AS (
+    SELECT 'TableConfluence', base.idConfluence, base.nameConfluence, distance, base
+    FROM VECTOR_SEARCH(
+      TABLE `myproj.mydata.TableConfluence`,
+      'embedding_confluence_data',
+      (SELECT emb FROM query_vec), 'emb',
+      top_k => topK, distance_type => 'COSINE', options => '{}'
+    )
+    UNION ALL
+    SELECT 'TableConfluence', base.idConfluence, base.nameConfluence, distance, base
+    FROM VECTOR_SEARCH(
+      TABLE `myproj.mydata.TableConfluence`,
+      'embedding_confluence_contacts',
+      (SELECT emb FROM query_vec), 'emb',
+      top_k => topK, distance_type => 'COSINE', options => '{}'
+    )
+  ),
+  conf_best AS (
+    SELECT source_table, id, name, MIN(distance) AS best_distance
+    FROM conf_union
+    GROUP BY source_table, id, name
+  ),
+  conf_joined AS (
+    SELECT
+      b.source_table,
+      b.id,
+      b.name,
+      STRUCT(
+        CAST(NULL AS STRING) AS incId,
+        CAST(NULL AS STRING) AS incName,
+        CAST(NULL AS STRING) AS reqId,
+        CAST(NULL AS STRING) AS reqName,
+        c.idConfluence,
+        c.nameConfluence,
+        CAST(NULL AS STRING) AS error_text,
+        CAST(NULL AS STRING) AS solution_text,
+        CAST(NULL AS STRING) AS description_text,
+        CAST(NULL AS STRING) AS notes_text,
+        ct.embedding_confluence_data_text,
+        ct.embedding_confluence_contacts_text
+      ) AS base,
+      LEAST(GREATEST(1.0 - b.best_distance, 0.0), 1.0) AS score
+    FROM conf_best b
+    JOIN `myproj.mydata.TableConfluence` c
+      ON c.idConfluence = b.id
+    LEFT JOIN `myproj.mydata.TableConfluenceText` ct
+      ON ct.idConfluence = b.id
+  )
+
+  -- ================== Merge with flags & threshold; NO final LIMIT (per your choice) ==================
+  SELECT source_table, id, name, score, base
+  FROM (
+    SELECT * FROM inc_joined  WHERE search_incidents
+    UNION ALL
+    SELECT * FROM req_joined  WHERE search_requests
+    UNION ALL
+    SELECT * FROM conf_joined WHERE search_confluence
+  )
+  WHERE threshold IS NULL OR score >= threshold
+  ORDER BY score DESC
+);
+
 ============ SQL ============
 -- Location: us-central1
 -- Params: @q ARRAY<FLOAT64>, @topK INT64, @threshold FLOAT64 (nullable)
