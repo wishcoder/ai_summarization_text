@@ -464,3 +464,442 @@ private Object toJava(FieldValue v, Field f) {
 
 ---------------------------------------------------    
 
+<template>
+  <v-container class="pa-0 chat-root" fluid>
+    <!-- Header -->
+    <v-sheet class="px-4 py-3 border-b" elevation="0">
+      <div class="text-subtitle-1 font-weight-medium">Assist Chat</div>
+    </v-sheet>
+
+    <!-- Messages area -->
+    <v-sheet class="messages-wrap" elevation="0">
+      <div ref="scrollAreaEl" class="messages">
+        <div class="d-flex flex-column" style="gap: 12px;">
+          <!-- Bubbles -->
+          <template v-for="m in messages" :key="m.id">
+            <div
+              class="d-flex"
+              :class="m.sender === 'user' ? 'justify-end' : 'justify-start'"
+            >
+              <v-sheet
+                class="pa-3 rounded-xl bubble"
+                :class="m.sender === 'user' ? 'bubble-user' : 'bubble-bot'"
+                elevation="1"
+                max-width="80%"
+              >
+                <!-- If message has a Contacts table, render it -->
+                <div v-if="m.table" class="mb-2">
+                  <v-table density="comfortable">
+                    <thead>
+                      <tr>
+                        <th v-for="(h, i) in m.table.headers" :key="i" class="text-no-wrap">
+                          {{ h }}
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="(row, rIdx) in m.table.rows" :key="rIdx">
+                        <td v-for="(cell, cIdx) in row" :key="cIdx">
+                          {{ cell }}
+                        </td>
+                      </tr>
+                    </tbody>
+                  </v-table>
+                </div>
+
+                <!-- Otherwise render parsed text/link segments -->
+                <template v-else>
+                  <template v-for="(seg, idx) in m.segments" :key="idx">
+                    <span v-if="seg.type === 'text'">{{ seg.text }}</span>
+                    <v-btn
+                      v-else
+                      variant="text"
+                      density="compact"
+                      class="text-decoration-underline px-0"
+                      @click="onLinkClick((seg as LinkSegment).href)"
+                    >
+                      {{ (seg as LinkSegment).text }}
+                    </v-btn>
+                  </template>
+                </template>
+
+                <!-- Timestamp -->
+                <div class="timestamp">
+                  {{ formatTimestamp(m.timestamp) }}
+                </div>
+              </v-sheet>
+            </div>
+          </template>
+
+          <!-- Busy indicator -->
+          <div v-if="busy" class="d-flex justify-start">
+            <v-sheet class="pa-3 rounded-xl bubble bubble-bot" elevation="1" max-width="60%">
+              <div class="d-flex align-center" style="gap: 10px;">
+                <v-progress-circular indeterminate size="18" width="2" />
+                <span>Thinking…</span>
+              </div>
+            </v-sheet>
+          </div>
+
+          <!-- Bottom sentinel to ensure reliable scrolling -->
+          <div ref="bottomSentinel" style="height: 1px;"></div>
+        </div>
+      </div>
+    </v-sheet>
+
+    <!-- Sticky input area -->
+    <div class="input-sticky">
+      <v-divider />
+      <v-progress-linear v-if="busy" indeterminate height="3" />
+      <v-sheet class="px-3 py-2" elevation="0">
+        <v-text-field
+          ref="inputRef"
+          v-model="draft"
+          variant="outlined"
+          density="comfortable"
+          :disabled="busy"
+          :placeholder="busy ? 'Please wait…' : 'Type your message…'"
+          hide-details
+          clearable
+          @keydown.enter="trySend"
+          class="ma-0"
+        >
+          <template #append-inner>
+            <v-btn
+              icon
+              :disabled="busy || !canSend"
+              @click="trySend"
+              :aria-label="'Send message'"
+            >
+              <v-icon>mdi-send</v-icon>
+            </v-btn>
+          </template>
+        </v-text-field>
+      </v-sheet>
+    </div>
+  </v-container>
+</template>
+
+<script lang="ts">
+import { defineComponent, ref, computed, nextTick, watch, onMounted } from 'vue';
+import { sendQuery, processChatAction } from './AssistChat';
+
+type Sender = 'user' | 'bot';
+type TextSegment = { type: 'text'; text: string };
+type LinkSegment = { type: 'link'; text: string; href: string };
+type Segment = TextSegment | LinkSegment;
+
+interface TablePayload {
+  headers: string[];
+  rows: Array<Array<string | number | null>>;
+}
+
+interface ChatMessage {
+  id: string;
+  sender: Sender;
+  raw: string;
+  segments: Segment[];
+  timestamp: Date;
+  table?: TablePayload | null; // present only when Contacts JSON detected
+}
+
+export default defineComponent({
+  name: 'AssistChat',
+  setup() {
+    const messages = ref<ChatMessage[]>([]);
+    const draft = ref('');
+    const busy = ref(false);
+
+    // Refs for scrolling & focus
+    const scrollAreaEl = ref<HTMLElement | null>(null);
+    const bottomSentinel = ref<HTMLElement | null>(null);
+    const inputRef = ref<any | null>(null);
+
+    const canSend = computed(() => draft.value.trim().length > 0 && !busy.value);
+
+    function uid(): string {
+      return Math.random().toString(36).slice(2, 9);
+    }
+
+    function formatTimestamp(d: Date): string {
+      return new Intl.DateTimeFormat('en-US', {
+        month: '2-digit',
+        day: '2-digit',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      }).format(d);
+    }
+
+    /**
+     * Parse <a href="..">text</a> segments from HTMLish strings; plain text otherwise.
+     */
+    function parseAnchorSegments(htmlish: string): Segment[] {
+      const container = document.createElement('div');
+      container.innerHTML = htmlish;
+      const result: Segment[] = [];
+
+      function walk(node: ChildNode) {
+        if (node.nodeType === Node.TEXT_NODE) {
+          const text = node.textContent ?? '';
+          if (text) result.push({ type: 'text', text });
+          return;
+        }
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          const el = node as HTMLElement;
+          if (el.tagName.toLowerCase() === 'a') {
+            const href = el.getAttribute('href') || '';
+            const text = el.textContent?.trim() || href || 'link';
+            result.push({ type: 'link', text, href });
+            return;
+          }
+          Array.from(node.childNodes).forEach(walk);
+        }
+      }
+      Array.from(container.childNodes).forEach(walk);
+      return result.length ? result : [{ type: 'text', text: htmlish }];
+    }
+
+    /**
+     * Try to parse a server response string as JSON with the expected Contacts shape.
+     * Expected:
+     * {
+     *   "Contacts": [
+     *     { "header1":"Id", "header2":"Name", ... },
+     *     { "Id":"1", "Name":"Alice" },
+     *     ...
+     *   ]
+     * }
+     */
+    function tryParseContactsTable(raw: string): TablePayload | null {
+      let obj: any;
+      try {
+        obj = JSON.parse(raw);
+      } catch {
+        return null; // not JSON
+      }
+      if (!obj || typeof obj !== 'object' || !Array.isArray(obj.Contacts) || obj.Contacts.length === 0) {
+        return null;
+      }
+      const arr: any[] = obj.Contacts;
+
+      // First item must be header map: { header1: "Id", header2:"Name", ... }
+      const headerMap = arr[0];
+      if (!headerMap || typeof headerMap !== 'object') return null;
+
+      // Get header keys ordered by "headerN" (numeric suffix), then map to their values
+      const headerKeys = Object.keys(headerMap)
+        .sort((a, b) => {
+          const na = Number(String(a).replace(/[^\d]/g, '') || '0');
+          const nb = Number(String(b).replace(/[^\d]/g, '') || '0');
+          return na - nb;
+        });
+
+      const headers = headerKeys.map(k => String(headerMap[k] ?? '').trim());
+
+      // Build rows from remaining entries by matching the header names
+      const rows: Array<Array<string | number | null>> = [];
+      for (let i = 1; i < arr.length; i++) {
+        const rowObj = arr[i] ?? {};
+        const row = headers.map((h) => {
+          const v = rowObj[h];
+          return v === undefined ? null : (typeof v === 'object' ? JSON.stringify(v) : v);
+        });
+        rows.push(row);
+      }
+
+      return { headers, rows };
+    }
+
+    async function scrollToBottom(smooth = false) {
+      await nextTick();
+      await new Promise(requestAnimationFrame);
+
+      const sentinel = bottomSentinel.value;
+      if (sentinel?.scrollIntoView) {
+        sentinel.scrollIntoView({ behavior: smooth ? 'smooth' : 'auto', block: 'end' });
+        return;
+      }
+      const el = scrollAreaEl.value;
+      if (!el) return;
+      if (typeof (el as any).scrollTo === 'function') {
+        (el as any).scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
+      } else {
+        el.scrollTop = el.scrollHeight;
+      }
+    }
+
+    async function focusInput() {
+      await nextTick();
+      await new Promise(requestAnimationFrame);
+      if (inputRef.value?.focus) {
+        inputRef.value.focus();
+        return;
+      }
+      const el: HTMLInputElement | null = inputRef.value?.$el?.querySelector?.('input') ?? null;
+      el?.focus();
+    }
+
+    function appendMessage(sender: Sender, raw: string) {
+      // If bot message, check for Contacts table
+      let table: TablePayload | null = null;
+      if (sender === 'bot') {
+        table = tryParseContactsTable(raw);
+      }
+
+      messages.value.push({
+        id: uid(),
+        sender,
+        raw,
+        segments: table ? [] : parseAnchorSegments(raw),
+        timestamp: new Date(),
+        table: table ?? undefined,
+      });
+
+      scrollToBottom(sender === 'user');
+    }
+
+    function updateResult(response: string) {
+      appendMessage('bot', response);
+      scrollToBottom(true);
+      focusInput();
+    }
+
+    async function trySend() {
+      if (!canSend.value) return;
+
+      const text = draft.value.trim();
+      draft.value = '';
+      appendMessage('user', text);
+
+      busy.value = true;
+      await scrollToBottom(false);
+
+      try {
+        const response = await sendQuery(text);
+        updateResult(response);
+      } catch (err) {
+        updateResult('Sorry, something went wrong.');
+        console.error(err);
+      } finally {
+        busy.value = false;
+        focusInput();
+      }
+    }
+
+    function onLinkClick(href: string) {
+      processChatAction(href);
+      focusInput();
+    }
+
+    // Safety net: auto-scroll on message count changes
+    watch(
+      () => messages.value.length,
+      () => scrollToBottom(false),
+    );
+
+    onMounted(() => {
+      focusInput();
+      scrollToBottom(false);
+    });
+
+    return {
+      // state
+      messages,
+      draft,
+      busy,
+      // refs
+      scrollAreaEl,
+      bottomSentinel,
+      inputRef,
+      // computed & methods
+      canSend,
+      trySend,
+      onLinkClick,
+      formatTimestamp,
+    };
+  },
+});
+</script>
+
+<style scoped>
+.chat-root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+  background: #ffffff;
+}
+
+.border-b {
+  border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+/* Flex child that allows inner div to scroll */
+.messages-wrap {
+  flex: 1 1 0;
+  min-height: 0;
+  background: transparent;
+  padding: 0;
+}
+.messages {
+  height: 100%;
+  overflow: auto;
+  min-height: 0;
+  padding: 16px 12px;
+}
+
+.input-sticky {
+  position: sticky;
+  bottom: 0;
+  background: #ffffff;
+  z-index: 2;
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+.bubble {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* User bubble = silver */
+.bubble-user {
+  background-color: silver !important;
+  color: rgba(0, 0, 0, 0.87);
+}
+
+/* Bot bubble = green */
+.bubble-bot {
+  background-color: #A5D6A7 !important;
+  color: rgba(0, 0, 0, 0.87);
+}
+
+.text-decoration-underline {
+  text-decoration: underline;
+}
+
+.timestamp {
+  margin-top: 6px;
+  font-size: 0.75rem;
+  color: rgba(0, 0, 0, 0.54);
+  text-align: right;
+}
+</style>
+
+---------------------------------------------------    
+
+export async function sendQuery(userText: string): Promise<string> {
+  await new Promise((r) => setTimeout(r, 1000));
+  if (userText.trim().toLowerCase().includes('contacts')) {
+    return JSON.stringify({
+      Contacts: [
+        { header1: "Id", header2: "Name", header3: "Email" },
+        { Id: "101", Name: "Alice", Email: "alice@example.com" },
+        { Id: "102", Name: "Bob",   Email: "bob@example.com" }
+      ]
+    });
+  }
+  // ...your other branches...
+  return `Hello! See <a href="https://vuetifyjs.com/en/components/tables/">Vuetify tables</a>`;
+}
