@@ -621,6 +621,90 @@ public class SemanticSearchService {
 
 ---------------------------------------------------
 
+// Put these in SemanticSearchService
+private static final int MAX_SUMMARY_CHARS = 250;
+
+private static String normalizeWhitespace(String s) {
+    if (s == null) return "";
+    return s.replaceAll("\\s+", " ").trim();
+}
+
+private static String truncateToLength(String s, int maxChars) {
+    if (s == null) return "";
+    if (s.length() <= maxChars) return s;
+    // try not to cut mid-word; fall back to hard cut
+    int end = Math.max(0, Math.min(s.length(), maxChars));
+    int cut = s.lastIndexOf(' ', end);
+    if (cut >= 0 && cut >= end - 40) { // prefer a nearby word boundary
+        end = cut;
+    }
+    String base = s.substring(0, end).trim();
+    if (base.length() < s.length()) {
+        return base + "…";
+    }
+    return base;
+}
+
+private String summarize(String sourceTable, String id, String name, Map<String, Object> fields) {
+    List<String> keys = switch (sourceTable) {
+        case "TableIncidents"  -> List.of("error_text","solution_text","incName");
+        case "TableIRequests"  -> List.of("description_text","notes_text","reqName");
+        case "TableConfluence" -> List.of("confluence_data_text","confluence_contacts_text","nameConfluence");
+        default -> List.of();
+    };
+    StringBuilder sb = new StringBuilder();
+    for (String k : keys) {
+        Object v = fields.get(k);
+        if (v instanceof String s && !s.isBlank()) {
+            sb.append(k).append(": ").append(s.length() > 4000 ? s.substring(0, 4000) + "…" : s).append("\n");
+        }
+    }
+    if (sb.length() == 0) sb.append(fields);
+
+    String system = """
+        You are a concise summarizer for incidents/requests/confluence notes.
+        Return a single sentence, factual, no speculation, no bullet points or lists.
+        HARD REQUIREMENT: <= 220 characters (do not exceed).
+        """;
+    String user = "Source=%s, id=%s, name=%s\n\nContent:\n%s"
+            .formatted(sourceTable, id, name, sb);
+
+    return chatClient
+        .prompt(new SystemMessage(system))
+        .prompt(new UserMessage(user))
+        .call()
+        .content();
+}
+
+Compute the score suffix first, then cap the content so that content + suffix ≤ 250.
+
+for (FieldValueList r : rows.iterateAll()) {
+    String sourceTable = r.get("source_table").getStringValue();
+    String id   = r.get("id").getStringValue();
+    String name = r.get("name").isNull() ? "" : r.get("name").getStringValue();
+    double score = r.get("score").getDoubleValue();
+
+    Map<String,Object> fields = toMap(r.get("base"), baseSubs);
+
+    // 1) get model summary
+    String raw = summarize(sourceTable, id, name, fields);
+
+    // 2) normalize whitespace to stabilize char counts
+    String normalized = normalizeWhitespace(raw);
+
+    // 3) build score suffix and compute remaining budget
+    String suffix = String.format(" (score: %.3f)", score);
+    int maxContent = Math.max(0, MAX_SUMMARY_CHARS - suffix.length());
+
+    // 4) truncate content to fit within the remaining budget, then append suffix
+    String cappedContent = truncateToLength(normalized, maxContent);
+    String summary = cappedContent + suffix;
+
+    items.add(new SearchResultItem(sourceTable, id, name, score, summary, fields));
+}
+
+---------------------------------------------------
+
 private Object toJava(FieldValue v, Field f) {
         if (v.isNull()) return null;
         switch (f.getType().getStandardType()) {
