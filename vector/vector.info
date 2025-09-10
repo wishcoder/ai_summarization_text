@@ -1426,3 +1426,589 @@ export async function sendQuery(userText: string): Promise<string> {
     ]
   });
 }
+
+
+--------------------------------------------------------------------------------------
+
+<template>
+  <v-container class="pa-0 chat-root" fluid>
+    <!-- Header -->
+    <v-sheet class="px-4 py-3 border-b" elevation="0">
+      <div class="text-subtitle-1 font-weight-medium">AI Chat</div>
+    </v-sheet>
+
+    <!-- Messages area -->
+    <v-sheet class="messages-wrap" elevation="0">
+      <div ref="scrollAreaEl" class="messages">
+        <div class="d-flex flex-column" style="gap: 12px;">
+          <!-- Bubbles -->
+          <template v-for="m in messages" :key="m.id">
+            <div
+              class="d-flex"
+              :class="m.sender === 'user' ? 'justify-end' : 'justify-start'"
+            >
+              <!-- anchor target for user bubbles -->
+              <div v-if="m.sender === 'user'" :id="m.anchorId" class="bubble-anchor" />
+
+              <v-sheet
+                class="pa-3 rounded-xl bubble"
+                :class="m.sender === 'user' ? 'bubble-user' : 'bubble-bot'"
+                elevation="1"
+                max-width="80%"
+              >
+                <!-- If parsed server entries exist, render them all in one bubble -->
+                <div v-if="m.entries && m.entries.length">
+                  <div v-for="(e, idx) in m.entries" :key="idx" class="entry-block">
+                    <div class="entry-line">
+                      <span class="font-weight-bold">Score: {{ e.score }}</span>
+                      <span>&nbsp;</span>
+
+                      <!-- Render processed $$... [id] $$ segments -->
+                      <template v-for="(seg, k) in e.textSegments" :key="k">
+                        <span v-if="seg.type === 'text'">{{ seg.text }}</span>
+                        <v-btn
+                          v-else
+                          variant="text"
+                          density="compact"
+                          class="px-0 link-underline link-bold"
+                          @click="onLinkClick((seg as LinkSegment).href)"
+                        >
+                          {{ (seg as LinkSegment).text }}
+                        </v-btn>
+                      </template>
+                    </div>
+
+                    <!-- Optional contacts table (confluence only) -->
+                    <div v-if="e.table" class="mt-2">
+                      <v-table density="comfortable">
+                        <thead>
+                          <tr>
+                            <th v-for="(h, i) in e.table.headers" :key="i" class="text-no-wrap">
+                              {{ h }}
+                            </th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr v-for="(row, rIdx) in e.table.rows" :key="rIdx">
+                            <td v-for="(cell, cIdx) in row" :key="cIdx">
+                              {{ cell }}
+                            </td>
+                          </tr>
+                        </tbody>
+                      </v-table>
+                    </div>
+
+                    <v-divider v-if="idx < m.entries.length - 1" class="my-3" />
+                  </div>
+                </div>
+
+                <!-- Fallback: non-JSON text/anchor rendering -->
+                <template v-else>
+                  <template v-for="(seg, idx) in m.segments" :key="idx">
+                    <span v-if="seg.type === 'text'">{{ seg.text }}</span>
+                    <v-btn
+                      v-else
+                      variant="text"
+                      density="compact"
+                      class="px-0 link-underline"
+                      @click="onLinkClick((seg as LinkSegment).href)"
+                    >
+                      {{ (seg as LinkSegment).text }}
+                    </v-btn>
+                  </template>
+                </template>
+
+                <!-- Timestamp -->
+                <div class="timestamp">
+                  {{ formatTimestamp(m.timestamp) }}
+                </div>
+              </v-sheet>
+            </div>
+          </template>
+
+          <!-- Busy indicator (AI-style) -->
+          <div v-if="busy" class="d-flex justify-start">
+            <v-sheet class="pa-3 rounded-xl bubble bubble-bot" elevation="1" max-width="60%">
+              <div class="d-flex align-center" style="gap: 10px;">
+                <span class="vertex-anim" aria-hidden="true">
+                  <v-icon size="22" class="vertex-sparkle">mdi-creation</v-icon>
+                </span>
+                <span>{{ busyMessage }}</span>
+              </div>
+            </v-sheet>
+          </div>
+
+          <!-- Bottom sentinel to ensure reliable scrolling -->
+          <div ref="bottomSentinel" style="height: 1px;"></div>
+        </div>
+      </div>
+    </v-sheet>
+
+    <!-- Sticky input area -->
+    <div class="input-sticky">
+      <v-divider />
+      <v-progress-linear v-if="busy" indeterminate height="3" />
+      <v-sheet class="px-3 py-2" elevation="0">
+        <v-text-field
+          ref="inputRef"
+          v-model="draft"
+          variant="outlined"
+          density="comfortable"
+          :disabled="busy"
+          :placeholder="busy ? busyMessage : 'Type your message…'"
+          hide-details
+          clearable
+          @keydown.enter="trySend"
+          class="ma-0"
+        >
+          <template #append-inner>
+            <v-btn
+              icon
+              :disabled="busy || !canSend"
+              @click="trySend"
+              :aria-label="'Send message'"
+            >
+              <v-icon>mdi-send</v-icon>
+            </v-btn>
+          </template>
+        </v-text-field>
+      </v-sheet>
+    </div>
+  </v-container>
+</template>
+
+<script lang="ts">
+import {
+  defineComponent, ref, computed, nextTick, watch,
+  onMounted, onBeforeUnmount, reactive, toRaw, getCurrentInstance, expose
+} from 'vue';
+import { sendQuery, processChatAction } from './AssistChat';
+
+type Sender = 'user' | 'bot';
+type TextSegment = { type: 'text'; text: string };
+type LinkSegment = { type: 'link'; text: string; href: string };
+type Segment = TextSegment | LinkSegment;
+
+interface TablePayload {
+  headers: string[];
+  rows: Array<Array<string | number | null>>;
+}
+interface RichMessageEntry {
+  score: string;
+  type: string;
+  textSegments: Segment[];
+  table?: TablePayload | null;
+}
+interface ChatMessage {
+  id: string;
+  sender: Sender;
+  raw: string;
+  segments: Segment[];     // fallback/plain path
+  timestamp: Date;
+  entries?: RichMessageEntry[]; // server "messages" array rendered in this bubble
+  anchorId?: string;            // only for user bubbles
+}
+
+export default defineComponent({
+  name: 'AssistChat',
+  emits: ['anchors-updated'], // notify parent/sidebar
+  setup(_, { emit }) {
+    // --- State ---
+    const messages = ref<ChatMessage[]>([]);
+    const draft = ref('');
+    const busy = ref(false);
+
+    // Busy message rotation (one pass, stop at last)
+    const busyMessages = [
+      'Thinking…',
+      'Connecting to data sources…',
+      'Retrieving data…',
+      'Preparing data…', // final; freeze here
+    ] as const;
+    const busyMessage = ref(busyMessages[0]);
+    let busyTimer: ReturnType<typeof setInterval> | null = null;
+    let busyIdx = 0;
+
+    // Refs for scrolling & focus
+    const scrollAreaEl = ref<HTMLElement | null>(null);
+    const bottomSentinel = ref<HTMLElement | null>(null);
+    const inputRef = ref<any | null>(null);
+
+    // --- Anchor map (key -> anchorId) ---
+    // Keys: user text, bot hyperlink href; Value: anchor id of latest user bubble
+    const anchorMap = reactive(new Map<string, string>());
+    let lastUserAnchorId: string | null = null;
+
+    const canSend = computed(() => draft.value.trim().length > 0 && !busy.value);
+
+    // --- Formatting ---
+    function formatTimestamp(d: Date): string {
+      return new Intl.DateTimeFormat('en-US', {
+        month: '2-digit',
+        day: '2-digit',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      }).format(d);
+    }
+
+    // --- Parsing helpers ---
+    function parseAnchorSegments(htmlish: string): Segment[] {
+      const container = document.createElement('div');
+      container.innerHTML = htmlish;
+      const result: Segment[] = [];
+      function walk(node: ChildNode) {
+        if (node.nodeType === Node.TEXT_NODE) {
+          const text = node.textContent ?? '';
+          if (text) result.push({ type: 'text', text });
+          return;
+        }
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          const el = node as HTMLElement;
+          if (el.tagName.toLowerCase() === 'a') {
+            const href = el.getAttribute('href') || '';
+            const text = el.textContent?.trim() || href || 'link';
+            result.push({ type: 'link', text, href });
+            return;
+          }
+          Array.from(node.childNodes).forEach(walk);
+        }
+      }
+      Array.from(container.childNodes).forEach(walk);
+      return result.length ? result : [{ type: 'text', text: htmlish }];
+    }
+
+    // Convert $$... [id] $$ into segments (link text is full inside, href is [id])
+    function parseDollarLinkSegments(text: string): Segment[] {
+      const segs: Segment[] = [];
+      const regex = /\$\$(.+?)\$\$/g;
+      let lastIndex = 0;
+      let match: RegExpExecArray | null;
+      while ((match = regex.exec(text)) !== null) {
+        const start = match.index;
+        const end = regex.lastIndex;
+        const inside = match[1];
+        if (start > lastIndex) segs.push({ type: 'text', text: text.slice(lastIndex, start) });
+        const idMatch = inside.match(/\[([^\]]+)\]/);
+        const id = idMatch ? idMatch[1] : inside;
+        segs.push({ type: 'link', text: inside, href: id });
+        lastIndex = end;
+      }
+      if (lastIndex < text.length) segs.push({ type: 'text', text: text.slice(lastIndex) });
+      return segs.length ? segs : [{ type: 'text', text }];
+    }
+
+    function buildContactsTable(contacts: any[]): TablePayload | null {
+      if (!Array.isArray(contacts) || contacts.length === 0) return null;
+      const headerMap = contacts[0];
+      if (!headerMap || typeof headerMap !== 'object') return null;
+
+      const headerKeys = Object.keys(headerMap).sort((a, b) => {
+        const na = Number(String(a).replace(/[^\d]/g, '') || '0');
+        const nb = Number(String(b).replace(/[^\d]/g, '') || '0');
+        return na - nb;
+      });
+      const headers = headerKeys.map((k) => String(headerMap[k] ?? '').trim());
+
+      const rows: Array<Array<string | number | null>> = [];
+      for (let i = 1; i < contacts.length; i++) {
+        const rowObj = contacts[i] ?? {};
+        const row = headers.map((h) => {
+          const v = rowObj[h];
+          return v === undefined ? null : (typeof v === 'object' ? JSON.stringify(v) : v);
+        });
+        rows.push(row);
+      }
+      return { headers, rows };
+    }
+
+    function tryParseServerMessages(raw: string) {
+      let obj: any;
+      try { obj = JSON.parse(raw); } catch { return null; }
+      if (!obj || typeof obj !== 'object' || !Array.isArray(obj.messages)) return null;
+
+      const result: RichMessageEntry[] = [];
+      for (const item of obj.messages) {
+        const score = String(item?.score ?? '');
+        const type = String(item?.type ?? '');
+        const text = String(item?.text ?? '');
+        const textSegments = parseDollarLinkSegments(text);
+
+        let table: TablePayload | null = null;
+        if (type === 'confluence' && Array.isArray(item?.contacts) && item.contacts.length) {
+          table = buildContactsTable(item.contacts);
+        }
+        result.push({ score, type, textSegments, table });
+      }
+      return result;
+    }
+
+    // --- Scroll/focus helpers ---
+    async function scrollToBottom(smooth = false) {
+      await nextTick();
+      await new Promise(requestAnimationFrame);
+      const sentinel = bottomSentinel.value;
+      if (sentinel?.scrollIntoView) {
+        sentinel.scrollIntoView({ behavior: smooth ? 'smooth' : 'auto', block: 'end' });
+        return;
+      }
+      const el = scrollAreaEl.value;
+      if (!el) return;
+      if (typeof (el as any).scrollTo === 'function') {
+        (el as any).scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
+      } else {
+        el.scrollTop = el.scrollHeight;
+      }
+    }
+
+    async function focusInput() {
+      await nextTick(); await new Promise(requestAnimationFrame);
+      if (inputRef.value?.focus) { inputRef.value.focus(); return; }
+      const el: HTMLInputElement | null = inputRef.value?.$el?.querySelector?.('input') ?? null;
+      el?.focus();
+    }
+
+    // --- Anchor helpers ---
+    function emitAnchorsUpdated() {
+      // Emit a plain array so parent can render without worrying about Map
+      const entries = Array.from(anchorMap.entries()).map(([key, id]) => ({ key, id }));
+      emit('anchors-updated', entries);
+    }
+
+    function registerAnchorKey(key: string, anchorId: string) {
+      if (!key || !anchorId) return;
+      anchorMap.set(key, anchorId);
+      emitAnchorsUpdated();
+    }
+
+    function getScrollContainer(): HTMLElement | null {
+      return scrollAreaEl.value;
+    }
+
+    async function scrollToAnchorId(id: string, smooth = true) {
+      await nextTick(); await new Promise(requestAnimationFrame);
+      const container = getScrollContainer();
+      if (!container) return;
+      const target = document.getElementById(id);
+      if (!target) return;
+
+      // Scroll within container (not whole page)
+      const containerRect = container.getBoundingClientRect();
+      const targetRect = target.getBoundingClientRect();
+      const offset = targetRect.top - containerRect.top + container.scrollTop - 8; // small padding
+      if (typeof (container as any).scrollTo === 'function') {
+        (container as any).scrollTo({ top: offset, behavior: smooth ? 'smooth' : 'auto' });
+      } else {
+        container.scrollTop = offset;
+      }
+    }
+
+    async function scrollToAnchorByKey(key: string) {
+      const id = anchorMap.get(key);
+      if (id) {
+        await scrollToAnchorId(id, true);
+      }
+    }
+
+    // --- Messaging core ---
+    function uid(): string { return Math.random().toString(36).slice(2, 9); }
+
+    function appendMessage(sender: Sender, raw: string) {
+      let entries: RichMessageEntry[] | null = null;
+      if (sender === 'bot') entries = tryParseServerMessages(raw);
+
+      const msg: ChatMessage = {
+        id: uid(),
+        sender,
+        raw,
+        segments: entries ? [] : parseAnchorSegments(raw),
+        timestamp: new Date(),
+        entries: entries ?? undefined,
+      };
+
+      // Create an anchor for every user message
+      if (sender === 'user') {
+        msg.anchorId = `anchor-${msg.id}`;
+      }
+
+      messages.value.push(msg);
+
+      // If user message: remember last anchor and record key -> anchorId for user text
+      if (sender === 'user' && msg.anchorId) {
+        lastUserAnchorId = msg.anchorId;
+        const textKey = raw.trim();
+        if (textKey) registerAnchorKey(textKey, msg.anchorId);
+      }
+
+      scrollToBottom(sender === 'user');
+    }
+
+    function updateResult(response: string) {
+      appendMessage('bot', response);
+      scrollToBottom(true);
+      focusInput();
+    }
+
+    async function trySend() {
+      if (!canSend.value) return;
+
+      const text = draft.value.trim();
+      draft.value = '';
+      appendMessage('user', text);
+
+      busy.value = true;
+      await scrollToBottom(false);
+
+      try {
+        const response = await sendQuery(text);
+        updateResult(response);
+      } catch (err) {
+        updateResult('Sorry, something went wrong.');
+        // eslint-disable-next-line no-console
+        console.error(err);
+      } finally {
+        busy.value = false;
+        focusInput();
+      }
+    }
+
+    function onLinkClick(href: string) {
+      // Store href -> last user anchor id
+      if (href && lastUserAnchorId) {
+        registerAnchorKey(href, lastUserAnchorId);
+      }
+      processChatAction(href);
+      focusInput();
+    }
+
+    // Busy message rotation controller
+    function stopBusyTimer() {
+      if (busyTimer) { clearInterval(busyTimer); busyTimer = null; }
+    }
+    watch(busy, (isBusy) => {
+      stopBusyTimer();
+      if (isBusy) {
+        busyIdx = 0;
+        busyMessage.value = busyMessages[busyIdx];
+        busyTimer = setInterval(() => {
+          if (busyIdx < busyMessages.length - 1) {
+            busyIdx += 1;
+            busyMessage.value = busyMessages[busyIdx];
+            if (busyIdx === busyMessages.length - 1) stopBusyTimer(); // freeze at last
+          }
+        }, 2000);
+      }
+    }, { immediate: true });
+
+    // Safety nets
+    watch(() => messages.value.length, () => scrollToBottom(false));
+    onMounted(() => { focusInput(); scrollToBottom(false); });
+    onBeforeUnmount(() => stopBusyTimer());
+
+    // Expose scroll methods so the parent/sidebar can call them via ref
+    expose({
+      scrollToAnchorId,
+      scrollToAnchorByKey,
+      getAnchorEntries: () => Array.from(anchorMap.entries()).map(([key, id]) => ({ key, id })),
+    });
+
+    return {
+      // state
+      messages, draft, busy, busyMessage,
+      // refs
+      scrollAreaEl, bottomSentinel, inputRef,
+      // computed & methods
+      canSend, trySend, onLinkClick, formatTimestamp,
+      // for local/manual testing (optional)
+      scrollToAnchorId, scrollToAnchorByKey,
+    };
+  },
+});
+</script>
+
+<style scoped>
+/* Layout */
+.chat-root { display: flex; flex-direction: column; height: 100%; width: 100%; background: #ffffff; }
+.border-b { border-bottom: 1px solid rgba(0, 0, 0, 0.08); }
+.messages-wrap { flex: 1 1 0; min-height: 0; background: transparent; padding: 0; }
+.messages { height: 100%; overflow: auto; min-height: 0; padding: 16px 12px; }
+.input-sticky { position: sticky; bottom: 0; background: #ffffff; z-index: 2; padding-bottom: env(safe-area-inset-bottom); }
+
+/* Anchor target (small invisible spacer so scroll lands nicely) */
+.bubble-anchor { height: 1px; margin-top: -4px; }
+
+/* Bubbles */
+.bubble { white-space: pre-wrap; word-break: break-word; }
+.bubble-user { background-color: silver !important; color: rgba(0, 0, 0, 0.87); }
+.bubble-bot { background-color: #A5D6A7 !important; color: rgba(0, 0, 0, 0.87); }
+
+/* Links rendered from $$... [id] $$ */
+.link-underline { text-decoration: underline; }
+.link-bold { font-weight: 600; }
+
+/* Timestamp */
+.timestamp { margin-top: 6px; font-size: 0.75rem; color: rgba(0, 0, 0, 0.54); text-align: right; }
+
+/* Entry spacing inside one bubble */
+.entry-block + .entry-block { margin-top: 10px; }
+.entry-line { line-height: 1.5; }
+
+/* Vertex-style animated busy icon */
+.vertex-anim { display: inline-flex; align-items: center; justify-content: center; animation: vertex-spin-pulse 12s linear infinite; }
+.vertex-sparkle {
+  background: conic-gradient(
+    from 0deg,
+    #7b61ff 0%,
+    #4f8cff 20%,
+    #00bcd4 40%,
+    #00e5a8 60%,
+    #ffd54f 80%,
+    #ff6e6e 100%
+  );
+  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+  animation: vertex-hue 4.5s linear infinite;
+}
+/* Hue shimmer */
+@keyframes vertex-hue { 0% { filter:none; } 50% { filter:hue-rotate(40deg) saturate(1.15); } 100% { filter:none; } }
+/* Slow rotate + gentle pulse */
+@keyframes vertex-spin-pulse { 0% { transform: rotate(0deg) scale(1); } 50% { transform: rotate(180deg) scale(1.12); } 100% { transform: rotate(360deg) scale(1); } }
+</style>
+
+-----------------------------------------------------------------------------
+
+<template>
+  <v-row class="h-100">
+    <v-col cols="3">
+      <!-- Your sidebar -->
+      <v-list dense>
+        <v-list-item
+          v-for="(e, i) in anchorEntries"
+          :key="i"
+          @click="chatRef?.scrollToAnchorByKey(e.key)"
+        >
+          <v-list-item-title>{{ e.key }}</v-list-item-title>
+        </v-list-item>
+      </v-list>
+    </v-col>
+
+    <v-col cols="9" class="h-100">
+      <AssistChat
+        ref="chatRef"
+        @anchors-updated="anchorEntries = $event"
+      />
+    </v-col>
+  </v-row>
+</template>
+
+<script setup lang="ts">
+import { ref } from 'vue';
+import AssistChat from './AssistChat.vue';
+
+const chatRef = ref<InstanceType<typeof AssistChat> | null>(null);
+const anchorEntries = ref<Array<{ key: string; id: string }>>([]);
+</script>
+
+<style>
+.h-100 { height: 100%; }
+</style>
