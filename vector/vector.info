@@ -2012,3 +2012,107 @@ const anchorEntries = ref<Array<{ key: string; id: string }>>([]);
 <style>
 .h-100 { height: 100%; }
 </style>
+
+
+
+-------------------------------------------------------------------------- Sidebar Delete Icon -------------------------------------------------------------------
+
+/** Find the user bubble index for an anchorId and the index of the next bot bubble after it. */
+function findIndicesForAnchor(anchorId: string): { userIdx: number; botIdx: number | null } {
+  const userIdx = messages.value.findIndex(
+    (m) => m.sender === 'user' && m.anchorId === anchorId
+  );
+  if (userIdx === -1) return { userIdx: -1, botIdx: null };
+
+  const botIdx = messages.value.slice(userIdx + 1).findIndex((m) => m.sender === 'bot');
+  return { userIdx, botIdx: botIdx === -1 ? null : userIdx + 1 + botIdx };
+}
+
+/** Remove all messages AFTER a given index; also prune anchor map accordingly. */
+function truncateAfterIndex(keepThroughIdx: number) {
+  if (keepThroughIdx >= messages.value.length - 1) return; // nothing to truncate
+
+  // Build a set of anchorIds that will remain after truncation
+  const remaining = new Set<string>();
+  for (let i = 0; i <= keepThroughIdx; i++) {
+    const m = messages.value[i];
+    if (m.sender === 'user' && m.anchorId) remaining.add(m.anchorId);
+  }
+
+  // Truncate the chat
+  messages.value.splice(keepThroughIdx + 1);
+
+  // Prune anchorMap entries whose anchorId no longer exists
+  for (const [key, id] of Array.from(anchorMap.entries())) {
+    if (!remaining.has(id)) anchorMap.delete(key);
+  }
+  emitAnchorsUpdated();
+}
+
+
+/** Scroll to anchor id, then delete everything AFTER the related bot bubble. */
+async function deleteAfterAnchorId(anchorId: string) {
+  if (!anchorId) return;
+
+  // 1) Scroll to the anchor so the user sees the context
+  await scrollToAnchorId(anchorId, true);
+
+  // 2) Compute indices and truncate after the related bot bubble
+  const { userIdx, botIdx } = findIndicesForAnchor(anchorId);
+  if (userIdx === -1) return;
+
+  // If no bot bubble after that user, keep only up to the user bubble
+  const cutAt = botIdx != null ? botIdx : userIdx;
+  truncateAfterIndex(cutAt);
+
+  // Optional: refocus the input afterwards
+  await nextTick();
+  focusInput();
+}
+
+/** Convenience for sidebar: provide a key (user text or href) instead of id. */
+async function deleteAfterAnchorByKey(key: string) {
+  const id = anchorMap.get(key);
+  if (!id) return;
+  await deleteAfterAnchorId(id);
+}
+
+
+
+<template>
+  <v-list density="compact" lines="one">
+    <v-list-item
+      v-for="(e, i) in anchorEntries"
+      :key="i"
+      @click="chatRef?.scrollToAnchorByKey(e.key)"
+    >
+      <v-list-item-title class="truncate">{{ e.key }}</v-list-item-title>
+
+      <template #append>
+        <v-btn
+          icon
+          size="x-small"
+          variant="text"
+          color="error"
+          @click.stop="chatRef?.deleteAfterAnchorByKey(e.key)"
+          :aria-label="`Delete after ${e.key}`"
+        >
+          <v-icon>mdi-delete-outline</v-icon>
+        </v-btn>
+      </template>
+    </v-list-item>
+  </v-list>
+</template>
+
+<script setup lang="ts">
+import { ref } from 'vue';
+import AssistChat from './AssistChat.vue';
+
+const chatRef = ref<InstanceType<typeof AssistChat> | null>(null);
+const anchorEntries = ref<Array<{ key: string; id: string }>>([]);
+
+// Listen for updates from AssistChat.vue
+function onAnchorsUpdated(list: Array<{ key: string; id: string }>) {
+  anchorEntries.value = list;
+}
+</script>
