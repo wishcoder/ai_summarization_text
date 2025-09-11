@@ -2116,3 +2116,545 @@ function onAnchorsUpdated(list: Array<{ key: string; id: string }>) {
   anchorEntries.value = list;
 }
 </script>
+
+------------------------------------- Template: add an icon before “Score"  ----------------------------------------------------
+<!-- inside the bot bubble, where you render e in m.entries -->
+<div class="entry-line">
+  <!-- NEW thumbs-up icon -->
+  <v-btn
+    size="x-small"
+    variant="text"
+    density="comfortable"
+    class="mr-2"
+    @click="onThumbsUpForMessageIndex(mIdx)"
+    :aria-label="'Thumbs up for this answer'"
+  >
+    <v-icon>mdi-thumb-up-outline</v-icon>
+  </v-btn>
+
+  <span class="font-weight-bold">Score: {{ e.score }}</span>
+  <span>&nbsp;</span>
+
+  <!-- existing segments rendering follows... -->
+  <template v-for="(seg, k) in e.textSegments" :key="k">
+    <span v-if="seg.type === 'text'">{{ seg.text }}</span>
+    <v-btn
+      v-else
+      variant="text"
+      density="compact"
+      class="px-0 link-underline link-bold"
+      @click="onLinkClick((seg as LinkSegment).href)"
+    >
+      {{ (seg as LinkSegment).text }}
+    </v-btn>
+  </template>
+</div>
+
+Note: your outer v-for over messages should expose the index so you can resolve the “previous user”:
+
+<template v-for="(m, mIdx) in messages" :key="m.id">
+  <!-- ... -->
+</template>
+
+/**
+ * Walk backward from a given message index to find the nearest
+ * previous 'user' bubble and return its raw text.
+ */
+function findPreviousUserText(msgIndex: number): string | null {
+  for (let i = msgIndex - 1; i >= 0; i--) {
+    const m = messages.value[i];
+    if (m?.sender === 'user') {
+      const raw = (m.raw ?? '').toString().trim();
+      return raw.length ? raw : null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Public handler for thumbs-up on a bot entry. Resolves previous user text,
+ * then delegates to your integration hook.
+ */
+function onThumbsUpForMessageIndex(msgIndex: number) {
+  const prevUserText = findPreviousUserText(msgIndex);
+  if (!prevUserText) {
+    // No previous user prompt found; you can no-op or toast here.
+    return;
+  }
+  handleThumbsUp(prevUserText);
+}
+
+/**
+ * Integration hook: send the previous user prompt to your backend, or
+ * emit an event so the parent can do it. Replace the emit with your call.
+ */
+function handleThumbsUp(previousUserPrompt: string) {
+  // Example 1: emit to parent (recommended for clean separation)
+  // emit('thumbs-up', previousUserPrompt);
+
+  // Example 2: call your own client API directly (pseudo-code)
+  // feedbackApi.sendThumbsUp({ prompt: previousUserPrompt });
+
+  // For now we’ll just log so you can see it wire up:
+  // eslint-disable-next-line no-console
+  console.log('ThumbsUp previous user prompt:', previousUserPrompt);
+}
+
+
+/* optional: tighter icon spacing before Score */
+.entry-line .v-btn.mr-2 {
+  margin-right: 8px !important;
+}
+
+-------------------------------------- Sub Queruries ----------------------------------------------
+
+// Request from UI
+public record SemanticSearchRequest(
+    String text,
+    Integer topK,
+    Double scoreThreshold,
+    Boolean searchIncidents,    // default true (initial search only)
+    Boolean searchRequests,     // default true
+    Boolean searchConfluence,   // default true
+    Integer promptId,           // client sends 0 to start a new session flow
+    String userSessionName      // required to scope per-user caches
+) {}
+
+// Response items
+public record SearchResultItem(
+    Integer promptId,           // batch id assigned by server for THIS response
+    String sourceTable,
+    String id,
+    String name,
+    Double bqScore,             // original BQ similarity (0..1); null for pure summary-only flows
+    Double summaryScore,        // follow-up similarity (0..1) between new query and stored summary; null in initial batch
+    String summary,             // <= 250 chars including suffix
+    Map<String, Object> fields  // non-embedding metadata from base + *Text tables
+) {}
+
+// Response wrapper
+public record SemanticSearchResponse(
+    Integer promptId,           // the new promptId the server assigned for THIS call
+    List<SearchResultItem> results
+) {}
+
+
+
+package com.example.search;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.cloud.bigquery.*;
+import org.springframework.ai.embedding.Embedding;
+import org.springframework.ai.embedding.EmbeddingModel;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.messages.SystemMessage;
+import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.ai.chat.model.ChatResponse;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+
+@Service
+public class SemanticSearchService {
+
+    // ---- Config knobs ----
+    private static final String JOB_LOCATION = "us-central1";
+    private static final int MAX_SUMMARY_CHARS = 250;
+    private static final int MAX_PROMPTS_PER_SESSION = 25;
+    private static final Duration SESSION_TTL = Duration.ofMinutes(30);
+
+    private final EmbeddingModel embeddingModel; // Vertex AI text-embedding-004
+    private final BigQuery bigQuery;
+    private final ChatClient chatClient;         // Vertex AI Gemini
+    private final ObjectMapper om = new ObjectMapper();
+
+    public SemanticSearchService(EmbeddingModel embeddingModel,
+                                 BigQuery bigQuery,
+                                 ChatClient chatClient) {
+        this.embeddingModel = embeddingModel;
+        this.bigQuery = bigQuery;
+        this.chatClient = chatClient;
+    }
+
+    // ====== Public entrypoint ======
+    public SemanticSearchResponse searchAndSummarize(SemanticSearchRequest req) {
+        // --- Validate + defaults
+        String query = Optional.ofNullable(req.text()).orElse("").trim();
+        if (!StringUtils.hasText(query)) {
+            return new SemanticSearchResponse(0, List.of());
+        }
+        int topK = Optional.ofNullable(req.topK()).orElse(10);
+        Double threshold = req.scoreThreshold(); // may be null
+        boolean inc  = req.searchIncidents()  == null ? true : req.searchIncidents();
+        boolean rq   = req.searchRequests()   == null ? true : req.searchRequests();
+        boolean conf = req.searchConfluence() == null ? true : req.searchConfluence();
+        String session = Optional.ofNullable(req.userSessionName()).orElse("default");
+
+        // --- Evict stale sessions once per call
+        evictStaleSessions();
+
+        // --- Get/create session state
+        SessionState state = sessions.computeIfAbsent(session, k -> new SessionState());
+        state.touch();
+
+        int incomingPromptId = Optional.ofNullable(req.promptId()).orElse(0);
+
+        if (incomingPromptId == 0 || state.isEmpty()) {
+            // ============ INITIAL FLOW: BigQuery TVF search ============
+            int newPromptId = state.nextPromptId();
+            List<CachedItem> cached = runInitialSearchAndSummarize(query, topK, threshold, inc, rq, conf);
+            // store with embeddings of summaries for future follow-ups
+            for (CachedItem item : cached) {
+                item.promptId = newPromptId;
+                item.summaryEmbedding = l2normalize(embed(item.summary)); // embed summary text
+            }
+            state.addBatch(newPromptId, cached);
+            state.enforcePromptLimit(MAX_PROMPTS_PER_SESSION);
+
+            List<SearchResultItem> out = cached.stream().map(ci -> new SearchResultItem(
+                newPromptId, ci.sourceTable, ci.id, ci.name, ci.bqScore, null, ci.summary, ci.fields
+            )).toList();
+
+            return new SemanticSearchResponse(newPromptId, out);
+        } else {
+            // ============ FOLLOW-UP FLOW: search over prior summaries ============
+            int newPromptId = state.nextPromptId();
+
+            // Gather candidates with promptId <= incomingPromptId
+            List<CachedItem> candidates = state.itemsUpTo(incomingPromptId);
+            if (candidates.isEmpty()) {
+                // Fallback to initial flow if somehow empty
+                return searchAndSummarize(new SemanticSearchRequest(query, topK, threshold, inc, rq, conf, 0, session));
+            }
+
+            // Embed new query (normalized)
+            List<Double> q = l2normalize(embed(query));
+
+            // Score by cosine (dot) against each summary embedding
+            List<ScoredItem> scored = new ArrayList<>();
+            for (CachedItem c : candidates) {
+                if (c.summaryEmbedding == null || c.summaryEmbedding.isEmpty()) continue;
+                double score = cosineSimilarity(q, c.summaryEmbedding);
+                if (threshold == null || score >= threshold) {
+                    scored.add(new ScoredItem(c, score));
+                }
+            }
+
+            // Take topK by summaryScore
+            scored.sort((a, b) -> Double.compare(b.summaryScore, a.summaryScore));
+            if (scored.size() > topK) scored = scored.subList(0, topK);
+
+            // Re-summarize (focused on new query) and store this new batch (with embeddings)
+            List<CachedItem> newBatch = new ArrayList<>();
+            for (ScoredItem si : scored) {
+                CachedItem base = si.base;
+                String focused = summarizeFocused(base.sourceTable, base.id, base.name, base.fields, query);
+                String finalSummary = capWithScores(focused, base.bqScore, si.summaryScore);
+
+                CachedItem copy = base.copy(); // shallow copy fields map
+                copy.promptId = newPromptId;
+                copy.summary = finalSummary;
+                copy.summaryEmbedding = l2normalize(embed(finalSummary)); // store for later follow-ups
+                // Keep original bqScore
+                newBatch.add(copy);
+            }
+
+            state.addBatch(newPromptId, newBatch);
+            state.enforcePromptLimit(MAX_PROMPTS_PER_SESSION);
+
+            List<SearchResultItem> out = newBatch.stream().map(ci -> new SearchResultItem(
+                newPromptId, ci.sourceTable, ci.id, ci.name, ci.bqScore, // keep original BQ score
+                // pull summary score by recomputing (or from the scored list map)
+                cosineSimilarity(q, ci.summaryEmbedding),
+                ci.summary, ci.fields
+            )).toList();
+
+            return new SemanticSearchResponse(newPromptId, out);
+        }
+    }
+
+    // ====== INITIAL: TVF + base summaries ======
+    private List<CachedItem> runInitialSearchAndSummarize(String query, int topK, Double threshold,
+                                                          boolean inc, boolean rq, boolean conf) {
+        // Embed + normalize query for TVF
+        List<Double> q = l2normalize(embed(query));
+
+        // Call TVF (returns source_table,id,name,score,base)
+        TableResult rows = callTvf(q, topK, threshold, inc, rq, conf);
+
+        // Schema ref to parse the base struct
+        Field baseField = rows.getSchema().getFields().get("base");
+        FieldList baseSubs = baseField.getSubFields();
+
+        List<CachedItem> out = new ArrayList<>();
+        for (FieldValueList r : rows.iterateAll()) {
+            String sourceTable = r.get("source_table").getStringValue();
+            String id   = r.get("id").getStringValue();
+            String name = r.get("name").isNull() ? "" : r.get("name").getStringValue();
+            double bqScore = r.get("score").getDoubleValue();
+            Map<String,Object> fields = toMap(r.get("base"), baseSubs);
+
+            // Generic concise summary (not focused)
+            String summaryRaw = summarizeGeneric(sourceTable, id, name, fields);
+            String summary = capWithScores(summaryRaw, bqScore, null);
+
+            CachedItem item = new CachedItem();
+            item.sourceTable = sourceTable;
+            item.id = id;
+            item.name = name;
+            item.fields = fields;
+            item.bqScore = bqScore;
+            item.summary = summary;
+            out.add(item);
+        }
+        return out;
+    }
+
+    private TableResult callTvf(List<Double> q, int topK, Double threshold,
+                                boolean inc, boolean rq, boolean conf) {
+        String sql = """
+            SELECT source_table, id, name, score, base
+            FROM `myproj.mydata.semantic_search_all`(
+              q => @q, topK => @topK, threshold => @threshold,
+              search_incidents => @inc, search_requests => @req, search_confluence => @conf
+            )
+            """;
+
+        Map<String, QueryParameterValue> params = new HashMap<>();
+        params.put("q", QueryParameterValue.array(q.toArray(new Double[0]), StandardSQLTypeName.FLOAT64));
+        params.put("topK", QueryParameterValue.int64(topK));
+        params.put("threshold", threshold == null
+            ? QueryParameterValue.nullOf(StandardSQLTypeName.FLOAT64)
+            : QueryParameterValue.float64(threshold));
+        params.put("inc", QueryParameterValue.bool(inc));
+        params.put("req", QueryParameterValue.bool(rq));
+        params.put("conf", QueryParameterValue.bool(conf));
+
+        QueryJobConfiguration qjc = QueryJobConfiguration.newBuilder(sql)
+            .setUseLegacySql(false)
+            .setNamedParameters(params)
+            .build();
+
+        JobId jobId = JobId.newBuilder().setLocation(JOB_LOCATION).build();
+        Job job = bigQuery.create(JobInfo.newBuilder(qjc).setJobId(jobId).build());
+
+        try {
+            job = job.waitFor();
+            if (job == null) throw new RuntimeException("Job disappeared");
+            if (job.getStatus().getError() != null) {
+                throw new RuntimeException(job.getStatus().getError().toString());
+            }
+            return job.getQueryResults();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(e);
+        }
+    }
+
+    // ====== Summarizers (generic & focused) with 250-char cap ======
+    private String summarizeGeneric(String sourceTable, String id, String name, Map<String, Object> fields) {
+        String content = buildPreferredContent(sourceTable, fields);
+        String system = """
+            You are a concise summarizer for incidents/requests/confluence notes.
+            Return one sentence, factual, no speculation, no lists.
+            HARD LIMIT: <= 220 characters.
+            """;
+        String user = "Source=%s, id=%s, name=%s\n\nContent:\n%s".formatted(sourceTable, id, name, content);
+        String raw = chatClient.prompt(new SystemMessage(system)).prompt(new UserMessage(user)).call().content();
+        return normalizeWhitespace(raw);
+    }
+
+    private String summarizeFocused(String sourceTable, String id, String name, Map<String, Object> fields, String query) {
+        String content = buildPreferredContent(sourceTable, fields);
+        String system = """
+            You are a concise summarizer that answers a follow-up query about prior results.
+            Focus ONLY on details relevant to the user's new query.
+            Return one sentence, factual, no speculation, no lists.
+            HARD LIMIT: <= 220 characters.
+            """;
+        String user = "UserQuery=%s\nSource=%s, id=%s, name=%s\n\nContent:\n%s"
+            .formatted(query, sourceTable, id, name, content);
+        String raw = chatClient.prompt(new SystemMessage(system)).prompt(new UserMessage(user)).call().content();
+        return normalizeWhitespace(raw);
+    }
+
+    private static String buildPreferredContent(String sourceTable, Map<String, Object> fields) {
+        List<String> keys = switch (sourceTable) {
+            case "TableIncidents"  -> List.of("error_text","solution_text","incName");
+            case "TableIRequests"  -> List.of("description_text","notes_text","reqName");
+            case "TableConfluence" -> List.of("confluence_data_text","confluence_contacts_text","nameConfluence");
+            default -> List.of();
+        };
+        StringBuilder sb = new StringBuilder();
+        for (String k : keys) {
+            Object v = fields.get(k);
+            if (v instanceof String s && !s.isBlank()) {
+                sb.append(k).append(": ")
+                  .append(s.length() > 4000 ? s.substring(0, 4000) + "…" : s)
+                  .append("\n");
+            }
+        }
+        if (sb.length() == 0) sb.append(fields);
+        return sb.toString();
+    }
+
+    // Compose final summary <= 250 chars, appending scores that exist
+    private static String capWithScores(String content, Double bqScore, Double summaryScore) {
+        String suffix;
+        if (bqScore != null && summaryScore != null) {
+            suffix = String.format(" (bq: %.3f, sum: %.3f)", bqScore, summaryScore);
+        } else if (bqScore != null) {
+            suffix = String.format(" (bq: %.3f)", bqScore);
+        } else if (summaryScore != null) {
+            suffix = String.format(" (sum: %.3f)", summaryScore);
+        } else {
+            suffix = "";
+        }
+
+        String norm = normalizeWhitespace(content);
+        int maxContent = Math.max(0, MAX_SUMMARY_CHARS - suffix.length());
+        String capped = truncateToLength(norm, maxContent);
+        return capped + suffix;
+    }
+
+    // ====== Embedding + similarity utils ======
+    private List<Double> embed(String text) {
+        List<Embedding> res = embeddingModel.embed(List.of(text)).getResults();
+        if (res.isEmpty()) throw new IllegalStateException("No embedding returned");
+        return res.get(0).getOutput();
+    }
+
+    private static List<Double> l2normalize(List<Double> v) {
+        double n = Math.sqrt(v.stream().mapToDouble(x -> x*x).sum());
+        if (n == 0) return v;
+        return v.stream().map(x -> x / n).collect(Collectors.toList());
+    }
+
+    private static double cosineSimilarity(List<Double> a, List<Double> b) {
+        int n = Math.min(a.size(), b.size());
+        double dot = 0.0;
+        for (int i = 0; i < n; i++) dot += a.get(i) * b.get(i);
+        // a and b are normalized already -> dot in [-1,1], clamp to [0,1] similarity
+        double sim = Math.max(-1.0, Math.min(1.0, dot));
+        return (sim + 1.0) / 2.0; // optional: map to 0..1; remove if you prefer raw cosine
+    }
+
+    private static String normalizeWhitespace(String s) {
+        if (s == null) return "";
+        return s.replaceAll("\\s+", " ").trim();
+    }
+
+    private static String truncateToLength(String s, int maxChars) {
+        if (s == null) return "";
+        if (s.length() <= maxChars) return s;
+        int end = Math.max(0, Math.min(s.length(), maxChars));
+        int cut = s.lastIndexOf(' ', end);
+        if (cut >= 0 && cut >= end - 40) end = cut;
+        String base = s.substring(0, end).trim();
+        return base.length() < s.length() ? base + "…" : base;
+    }
+
+    // ====== RECORD parsing ======
+    private Map<String, Object> toMap(FieldValue base, FieldList subFields) {
+        FieldValueList rec = base.getRecordValue();
+        Map<String, Object> out = new LinkedHashMap<>();
+        for (int i = 0; i < subFields.size(); i++) {
+            Field f = subFields.get(i);
+            FieldValue v = rec.get(i);
+            Object val = v.isNull() ? null : switch (f.getType().getStandardType()) {
+                case STRING  -> v.getStringValue();
+                case INT64   -> v.getLongValue();
+                case FLOAT64 -> v.getDoubleValue();
+                case BOOL    -> v.getBooleanValue();
+                default      -> v.getStringValue();
+            };
+            out.put(f.getName(), val);
+        }
+        return out;
+    }
+
+    // ====== Session cache ======
+    private static class CachedItem {
+        Integer promptId;                 // origin batch id
+        String sourceTable;
+        String id;
+        String name;
+        Double bqScore;                   // from BQ initial search
+        String summary;                   // <= 250 chars
+        List<Double> summaryEmbedding;    // normalized embedding of 'summary'
+        Map<String, Object> fields;
+
+        CachedItem copy() {
+            CachedItem c = new CachedItem();
+            c.promptId = this.promptId;
+            c.sourceTable = this.sourceTable;
+            c.id = this.id;
+            c.name = this.name;
+            c.bqScore = this.bqScore;
+            c.summary = this.summary;
+            c.summaryEmbedding = this.summaryEmbedding == null ? null : new ArrayList<>(this.summaryEmbedding);
+            c.fields = this.fields == null ? Map.of() : new LinkedHashMap<>(this.fields);
+            return c;
+        }
+    }
+
+    private static class ScoredItem {
+        final CachedItem base;
+        final double summaryScore;
+        ScoredItem(CachedItem base, double s) { this.base = base; this.summaryScore = s; }
+    }
+
+    private static class SessionState {
+        private final NavigableMap<Integer, List<CachedItem>> batches = new TreeMap<>();
+        private final AtomicInteger counter = new AtomicInteger(0);
+        private Instant lastAccess = Instant.now();
+
+        void touch() { lastAccess = Instant.now(); }
+        boolean isEmpty() { return batches.isEmpty(); }
+        int nextPromptId() { return counter.incrementAndGet(); }
+
+        void addBatch(int promptId, List<CachedItem> items) {
+            batches.put(promptId, items);
+        }
+
+        List<CachedItem> itemsUpTo(int promptIdInclusive) {
+            List<CachedItem> all = new ArrayList<>();
+            for (Map.Entry<Integer, List<CachedItem>> e : batches.headMap(promptIdInclusive, true).entrySet()) {
+                all.addAll(e.getValue());
+            }
+            return all;
+        }
+
+        void enforcePromptLimit(int maxPrompts) {
+            while (batches.size() > maxPrompts) {
+                Integer oldest = batches.firstKey();
+                batches.remove(oldest);
+            }
+        }
+
+        boolean isExpired() {
+            return Instant.now().isAfter(lastAccess.plus(SESSION_TTL));
+        }
+    }
+
+    private final ConcurrentHashMap<String, SessionState> sessions = new ConcurrentHashMap<>();
+
+    private void evictStaleSessions() {
+        for (Map.Entry<String, SessionState> e : sessions.entrySet()) {
+            if (e.getValue().isExpired()) {
+                sessions.remove(e.getKey());
+            }
+        }
+    }
+}
+
+
+
+
+
