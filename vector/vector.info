@@ -2654,7 +2654,138 @@ public class SemanticSearchService {
     }
 }
 
+-------------------------------------- conversational retrieval start --------------------------------------
 
+private Instant lastAccess = Instant.now();
+void touch() { lastAccess = Instant.now(); }
+boolean isExpired() { return Instant.now().isAfter(lastAccess.plus(SESSION_TTL)); }
+
+################
+### docsUpTo ###
+################
+List<Document> docsUpTo(int promptIdInclusive) {                            // NEW
+        List<Document> out = new ArrayList<>();
+        for (Document d : docLog) {
+            Object p = d.getMetadata().get("promptId");
+            if (p instanceof Number n && n.intValue() <= promptIdInclusive) {
+                out.add(d);
+            }
+        }
+        return out;
+    }
+
+  void enforcePromptLimit(int maxPrompts) {
+        while (batches.size() > maxPrompts) {
+            Integer oldest = batches.firstKey();
+            batches.remove(oldest);
+            // (Optional) also purge docLog entries whose promptId == oldest if you want strict pruning.
+        }
+    }
+
+#################################
+### buildSystemPromptFromDocs ###
+#################################
+private static String buildSystemPromptFromDocs(List<Document> docs) {
+    // Collect distinct prior prompts in chronological order of promptId
+    record PP(int pid, String p) {}
+    List<PP> prompts = new ArrayList<>();
+    for (Document d : docs) {
+        Object p = d.getMetadata().get("originalPrompt");
+        Object id = d.getMetadata().get("promptId");
+        if (p instanceof String s && !s.isBlank() && id instanceof Number n) {
+            prompts.add(new PP(n.intValue(), s.trim()));
+        }
+    }
+    prompts.sort(Comparator.comparingInt(pp -> pp.pid));
+
+    // Deduplicate while preserving order
+    LinkedHashSet<String> uniq = new LinkedHashSet<>();
+    for (PP pp : prompts) uniq.add(pp.p);
+
+    String joined = String.join(" | ", uniq);
+    if (joined.isBlank()) return "";
+
+    // Keep it concise; vector search embeds this string
+    if (joined.length() > 2000) joined = joined.substring(0, 2000) + "…";
+
+    return "PriorUserPrompts: " + joined;
+}
+
+##################################
+### conversationalVectorSearch ###
+##################################
+
+List<Document> eligibleDocs = docsUpTo(incomingPromptId);
+String systemPrompt = buildSystemPromptFromDocs(eligibleDocs);
+// SimpleVectorStore uses embeddings (it ignores "system" vs "user" roles),
+String augmentedQuery = systemPrompt.isBlank()
+            ? newUserQuery
+            : systemPrompt + "\n\nUserQuery: " + newUserQuery;
+
+ Semantic search via vector store (embedding is internal).
+    // We oversample (e.g., 5x) then filter again by promptId<=incoming (defensive),
+    // then compute score and return topK.
+    int oversampleK = Math.min(topK * 5, 200);
+    SearchRequest.SearchRequestBuilder srb = SearchRequest.builder()
+            .query(augmentedQuery)
+            .topK(oversampleK);
+    if (threshold != null) srb = srb.similarityThreshold(threshold);
+
+    List<Document> retrieved = state.store().similaritySearch(srb.build());
+
+    // 5) Enforce promptId<=incoming and take topK
+    List<Document> filtered = new ArrayList<>();
+    for (Document d : retrieved) {
+        Object p = d.getMetadata().get("promptId");
+        if (p instanceof Number n && n.intValue() <= incomingPromptId) {
+            filtered.add(d);
+        }
+    }
+    if (filtered.size() > topK) filtered = filtered.subList(0, topK);
+
+    // 6) Build results, computing summaryScore (query ↔ doc.content); keep bqScore from metadata if present
+    List<Double> qVec = l2normalize(embed(augmentedQuery));
+    List<SearchResultItem> out = new ArrayList<>();
+
+    for (Document d : filtered) {
+        String content = d.getContent();
+        Map<String,Object> meta = d.getMetadata();
+
+        String sourceTable = String.valueOf(meta.getOrDefault("sourceTable", ""));
+        String id = String.valueOf(meta.getOrDefault("id", ""));
+        String name = String.valueOf(meta.getOrDefault("name", ""));
+        Double bqScore = (meta.get("bqScore") instanceof Number bn) ? bn.doubleValue() : null;
+
+        // parse fields (if present)
+        Map<String,Object> fields = Map.of();
+        try {
+            String fieldsJson = (String) meta.get("fieldsJson");
+            if (fieldsJson != null) {
+                @SuppressWarnings("unchecked") Map<String,Object> parsed = om.readValue(fieldsJson, Map.class);
+                fields = new LinkedHashMap<>(parsed);
+            }
+        } catch (Exception ignored) {}
+
+        // compute similarity (0..1) between augmented query and doc content
+        List<Double> dVec = l2normalize(embed(content));
+        double summaryScore = cosineSimilarity(qVec, dVec);
+
+        // for conversational results we can either return the doc content or a focused 250-char summary
+        String focused = summarizeFocused(sourceTable, id, name, fields, newUserQuery);
+        String summary = capWithScores(focused, bqScore, summaryScore); // ≤ 250 chars incl. scores
+
+        // Use the *new* promptId (server will assign it at the caller; we set it later)
+        out.add(new SearchResultItem(
+            null, // will be filled by caller with the new server-assigned promptId
+            sourceTable, id, name, bqScore, summaryScore, summary, fields
+        ));
+    }
+    return out;
+}
+
+// enforcePromptLimit(MAX_PROMPTS_PER_SESSION);
+
+-------------------------------------- conversational retrieval end --------------------------------------
 
 
 
