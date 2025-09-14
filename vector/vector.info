@@ -3203,4 +3203,97 @@ Keep ≤ 8 prompts per call for good latency; if you often exceed that, increase
 -------------------------------------- hard-AND over prompts - end --------------------------------------
 
 
+-------------------------------------- CTE holding an array of structs - start  --------------------------------------
 
+WITH param_terms AS (
+  SELECT [
+    STRUCT([0.11, 0.22, 0.33] AS emb),
+    STRUCT([0.44, 0.55, 0.66] AS emb)
+  ] AS terms
+)
+...
+FROM inc_best b
+JOIN `myproj.mydata.TableIncidents` i ON i.incId = b.id
+CROSS JOIN param_terms p
+CROSS JOIN UNNEST(p.terms) AS t
+...
+WHERE s.n_terms = ARRAY_LENGTH(p.terms)
+
+
+
+
+WITH
+  query_vec AS (SELECT [/* combined / mean vector */] AS emb),
+  param_terms AS (
+    SELECT [
+      STRUCT([/* prompt 1 vector (768) */] AS emb),
+      STRUCT([/* prompt 2 vector (768) */] AS emb)
+      -- ... more prompts if needed
+    ] AS terms
+  ),
+
+-- ---- Candidate retrieval (union both sources, take best distance) ----
+err_cand AS (
+  SELECT base.incId AS id, distance
+  FROM VECTOR_SEARCH(
+    TABLE `myproj.mydata.tbl_embedding_error`,
+    'embedding_error',
+    (SELECT emb FROM query_vec), 'emb',
+    top_k => @candidateK, distance_type => 'COSINE', options => '{}'
+  )
+),
+kw_cand AS (
+  SELECT base.incId AS id, distance
+  FROM VECTOR_SEARCH(
+    TABLE `myproj.mydata.tbl_embedding_keywords`,
+    'embedding_keywords',
+    (SELECT emb FROM query_vec), 'emb',
+    top_k => @candidateK, distance_type => 'COSINE', options => '{}'
+  )
+),
+cand_best AS (
+  SELECT id, MIN(distance) AS best_distance
+  FROM (
+    SELECT * FROM err_cand
+    UNION ALL
+    SELECT * FROM kw_cand
+  )
+  GROUP BY id
+),
+
+-- ---- Per-candidate, enforce HARD AND across prompts ----
+inc_scores AS (
+  SELECT
+    i.incId                         AS id,
+    1.0 - cb.best_distance          AS bqScore,
+    MIN( 1.0 - (
+        /* Best of the two sources per prompt */
+        CASE
+          WHEN e.embedding_error IS NULL  AND k.embedding_keywords IS NULL THEN 2.0
+          WHEN e.embedding_error IS NULL  THEN COSINE_DISTANCE(t.emb, k.embedding_keywords)
+          WHEN k.embedding_keywords IS NULL THEN COSINE_DISTANCE(t.emb, e.embedding_error)
+          ELSE LEAST(
+            COSINE_DISTANCE(t.emb, e.embedding_error),
+            COSINE_DISTANCE(t.emb, k.embedding_keywords)
+          )
+        END
+    )) AS score,
+    COUNT(*) AS n_terms
+  FROM cand_best cb
+  JOIN `myproj.mydata.TableIncidents` i   ON i.incId = cb.id
+  LEFT JOIN `myproj.mydata.tbl_embedding_error` e
+         ON e.incId = cb.id
+  LEFT JOIN `myproj.mydata.tbl_embedding_keywords` k
+         ON k.incId = cb.id
+  CROSS JOIN UNNEST((SELECT terms FROM param_terms)) AS t       -- <<— here’s your “Option B” form
+  GROUP BY i.incId, cb.best_distance
+)
+
+SELECT *
+FROM inc_scores s
+WHERE s.n_terms = ARRAY_LENGTH((SELECT terms FROM param_terms))    -- all prompts present
+  AND (@threshold IS NULL OR s.score >= @threshold)
+ORDER BY s.score DESC
+LIMIT @topK;
+
+-------------------------------------- CTE holding an array of structs - end  --------------------------------------
