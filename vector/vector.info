@@ -2787,5 +2787,420 @@ String augmentedQuery = systemPrompt.isBlank()
 
 -------------------------------------- conversational retrieval end --------------------------------------
 
+-------------------------------------- hard-AND over prompts - start --------------------------------------
+
+########### Single-prompt (fast path)
+private static final String SQL_SINGLE = """
+WITH query_vec AS (SELECT @q_comb AS emb),
+
+-- Incidents candidates (best of two columns)
+inc_union AS (
+  SELECT 'TableIncidents' AS source_table, base.incId AS id, base.incName AS name, distance
+  FROM VECTOR_SEARCH(TABLE `myproj.mydata.TableIncidents`, 'embedding_error',
+    (SELECT emb FROM query_vec), 'emb', top_k => @candidateK, distance_type => 'COSINE', options => '{}')
+  UNION ALL
+  SELECT 'TableIncidents', base.incId, base.incName, distance
+  FROM VECTOR_SEARCH(TABLE `myproj.mydata.TableIncidents`, 'embedding_solution',
+    (SELECT emb FROM query_vec), 'emb', top_k => @candidateK, distance_type => 'COSINE', options => '{}')
+),
+inc_best AS (
+  SELECT source_table, id, name, MIN(distance) AS best_distance
+  FROM inc_union GROUP BY source_table, id, name
+),
+inc_joined AS (
+  SELECT
+    b.source_table, b.id, b.name,
+    LEAST(GREATEST(1.0 - b.best_distance, 0.0), 1.0) AS score,
+    LEAST(GREATEST(1.0 - b.best_distance, 0.0), 1.0) AS bqScore,
+    STRUCT(
+      i.incId, i.incName,
+      CAST(NULL AS STRING) AS reqId,
+      CAST(NULL AS STRING) AS reqName,
+      CAST(NULL AS STRING) AS idConfluence,
+      CAST(NULL AS STRING) AS nameConfluence,
+      it.embedding_error_text AS error_text,
+      it.embedding_solution_text AS solution_text,
+      CAST(NULL AS STRING) AS description_text,
+      CAST(NULL AS STRING) AS notes_text,
+      CAST(NULL AS STRING) AS confluence_data_text,
+      CAST(NULL AS STRING) AS confluence_contacts_text
+    ) AS base
+  FROM inc_best b
+  JOIN `myproj.mydata.TableIncidents` i ON i.incId = b.id
+  LEFT JOIN `myproj.mydata.TableIncidentsText` it ON it.incId = b.id
+),
+
+-- IRequests
+req_union AS (
+  SELECT 'TableIRequests' AS source_table, base.reqId AS id, base.reqName AS name, distance
+  FROM VECTOR_SEARCH(TABLE `myproj.mydata.TableIRequests`, 'embedding_description',
+    (SELECT emb FROM query_vec), 'emb', top_k => @candidateK, distance_type => 'COSINE', options => '{}')
+  UNION ALL
+  SELECT 'TableIRequests', base.reqId, base.reqName, distance
+  FROM VECTOR_SEARCH(TABLE `myproj.mydata.TableIRequests`, 'embedding_notes',
+    (SELECT emb FROM query_vec), 'emb', top_k => @candidateK, distance_type => 'COSINE', options => '{}')
+),
+req_best AS (
+  SELECT source_table, id, name, MIN(distance) AS best_distance
+  FROM req_union GROUP BY source_table, id, name
+),
+req_joined AS (
+  SELECT
+    b.source_table, b.id, b.name,
+    LEAST(GREATEST(1.0 - b.best_distance, 0.0), 1.0) AS score,
+    LEAST(GREATEST(1.0 - b.best_distance, 0.0), 1.0) AS bqScore,
+    STRUCT(
+      CAST(NULL AS STRING) AS incId,
+      CAST(NULL AS STRING) AS incName,
+      r.reqId, r.reqName,
+      CAST(NULL AS STRING) AS idConfluence,
+      CAST(NULL AS STRING) AS nameConfluence,
+      CAST(NULL AS STRING) AS error_text,
+      CAST(NULL AS STRING) AS solution_text,
+      rt.embedding_description_text AS description_text,
+      rt.embedding_notes_text AS notes_text,
+      CAST(NULL AS STRING) AS confluence_data_text,
+      CAST(NULL AS STRING) AS confluence_contacts_text
+    ) AS base
+  FROM req_best b
+  JOIN `myproj.mydata.TableIRequests` r ON r.reqId = b.id
+  LEFT JOIN `myproj.mydata.TableIRequestsText` rt ON rt.reqId = b.id
+),
+
+-- Confluence
+conf_union AS (
+  SELECT 'TableConfluence' AS source_table, base.idConfluence AS id, base.nameConfluence AS name, distance
+  FROM VECTOR_SEARCH(TABLE `myproj.mydata.TableConfluence`, 'embedding_confluence_data',
+    (SELECT emb FROM query_vec), 'emb', top_k => @candidateK, distance_type => 'COSINE', options => '{}')
+  UNION ALL
+  SELECT 'TableConfluence', base.idConfluence, base.nameConfluence, distance
+  FROM VECTOR_SEARCH(TABLE `myproj.mydata.TableConfluence`, 'embedding_confluence_contacts',
+    (SELECT emb FROM query_vec), 'emb', top_k => @candidateK, distance_type => 'COSINE', options => '{}')
+),
+conf_best AS (
+  SELECT source_table, id, name, MIN(distance) AS best_distance
+  FROM conf_union GROUP BY source_table, id, name
+),
+conf_joined AS (
+  SELECT
+    b.source_table, b.id, b.name,
+    LEAST(GREATEST(1.0 - b.best_distance, 0.0), 1.0) AS score,
+    LEAST(GREATEST(1.0 - b.best_distance, 0.0), 1.0) AS bqScore,
+    STRUCT(
+      CAST(NULL AS STRING) AS incId,
+      CAST(NULL AS STRING) AS incName,
+      CAST(NULL AS STRING) AS reqId,
+      CAST(NULL AS STRING) AS reqName,
+      c.idConfluence, c.nameConfluence,
+      CAST(NULL AS STRING) AS error_text,
+      CAST(NULL AS STRING) AS solution_text,
+      CAST(NULL AS STRING) AS description_text,
+      CAST(NULL AS STRING) AS notes_text,
+      ct.embedding_confluence_data_text AS confluence_data_text,
+      ct.embedding_confluence_contacts_text AS confluence_contacts_text
+    ) AS base
+  FROM conf_best b
+  JOIN `myproj.mydata.TableConfluence` c ON c.idConfluence = b.id
+  LEFT JOIN `myproj.mydata.TableConfluenceText` ct ON ct.idConfluence = b.id
+)
+
+SELECT * FROM (
+  SELECT * FROM inc_joined WHERE @inc
+  UNION ALL SELECT * FROM req_joined WHERE @req
+  UNION ALL SELECT * FROM conf_joined WHERE @conf
+)
+WHERE @threshold IS NULL OR score >= @threshold
+ORDER BY score DESC
+LIMIT @topK
+""";
+
+
+########### AND-mode (when userPrompts.size() > 1)
+
+private static final String SQL_AND = """
+WITH query_vec AS (SELECT @q_comb AS emb),
+
+-- Incidents: ANN candidates across both columns
+inc_union AS (
+  SELECT 'TableIncidents' AS source_table, base.incId AS id, base.incName AS name, distance
+  FROM VECTOR_SEARCH(TABLE `myproj.mydata.TableIncidents`, 'embedding_error',
+    (SELECT emb FROM query_vec), 'emb', top_k => @candidateK, distance_type => 'COSINE', options => '{}')
+  UNION ALL
+  SELECT 'TableIncidents', base.incId, base.incName, distance
+  FROM VECTOR_SEARCH(TABLE `myproj.mydata.TableIncidents`, 'embedding_solution',
+    (SELECT emb FROM query_vec), 'emb', top_k => @candidateK, distance_type => 'COSINE', options => '{}')
+),
+inc_best AS (
+  SELECT source_table, id, name, MIN(distance) AS best_distance
+  FROM inc_union GROUP BY source_table, id, name
+),
+inc_scores AS (
+  SELECT
+    b.source_table, b.id, b.name,
+    1.0 - b.best_distance AS bqScore,
+    MIN( 1.0 - LEAST(
+          COSINE_DISTANCE(t.emb, i.embedding_error),
+          COSINE_DISTANCE(t.emb, i.embedding_solution)
+        ) ) AS score,
+    COUNT(*) AS n_terms
+  FROM inc_best b
+  JOIN `myproj.mydata.TableIncidents` i ON i.incId = b.id
+  CROSS JOIN UNNEST(@terms) AS t
+  GROUP BY b.source_table, b.id, b.name, b.best_distance
+),
+inc_filtered AS (
+  SELECT
+    s.source_table, s.id, s.name, s.score, s.bqScore,
+    STRUCT(
+      i.incId, i.incName,
+      CAST(NULL AS STRING) AS reqId,
+      CAST(NULL AS STRING) AS reqName,
+      CAST(NULL AS STRING) AS idConfluence,
+      CAST(NULL AS STRING) AS nameConfluence,
+      it.embedding_error_text AS error_text,
+      it.embedding_solution_text AS solution_text,
+      CAST(NULL AS STRING) AS description_text,
+      CAST(NULL AS STRING) AS notes_text,
+      CAST(NULL AS STRING) AS confluence_data_text,
+      CAST(NULL AS STRING) AS confluence_contacts_text
+    ) AS base
+  FROM inc_scores s
+  JOIN `myproj.mydata.TableIncidents` i ON i.incId = s.id
+  LEFT JOIN `myproj.mydata.TableIncidentsText` it ON it.incId = s.id
+  WHERE s.n_terms = ARRAY_LENGTH(@terms)
+    AND ( @threshold IS NULL OR s.score >= @threshold )
+),
+
+-- IRequests
+req_union AS (
+  SELECT 'TableIRequests' AS source_table, base.reqId AS id, base.reqName AS name, distance
+  FROM VECTOR_SEARCH(TABLE `myproj.mydata.TableIRequests`, 'embedding_description',
+    (SELECT emb FROM query_vec), 'emb', top_k => @candidateK, distance_type => 'COSINE', options => '{}')
+  UNION ALL
+  SELECT 'TableIRequests', base.reqId, base.reqName, distance
+  FROM VECTOR_SEARCH(TABLE `myproj.mydata.TableIRequests`, 'embedding_notes',
+    (SELECT emb FROM query_vec), 'emb', top_k => @candidateK, distance_type => 'COSINE', options => '{}')
+),
+req_best AS (
+  SELECT source_table, id, name, MIN(distance) AS best_distance
+  FROM req_union GROUP BY source_table, id, name
+),
+req_scores AS (
+  SELECT
+    b.source_table, b.id, b.name,
+    1.0 - b.best_distance AS bqScore,
+    MIN( 1.0 - LEAST(
+          COSINE_DISTANCE(t.emb, r.embedding_description),
+          COSINE_DISTANCE(t.emb, r.embedding_notes)
+        ) ) AS score,
+    COUNT(*) AS n_terms
+  FROM req_best b
+  JOIN `myproj.mydata.TableIRequests` r ON r.reqId = b.id
+  CROSS JOIN UNNEST(@terms) AS t
+  GROUP BY b.source_table, b.id, b.name, b.best_distance
+),
+req_filtered AS (
+  SELECT
+    s.source_table, s.id, s.name, s.score, s.bqScore,
+    STRUCT(
+      CAST(NULL AS STRING) AS incId,
+      CAST(NULL AS STRING) AS incName,
+      r.reqId, r.reqName,
+      CAST(NULL AS STRING) AS idConfluence,
+      CAST(NULL AS STRING) AS nameConfluence,
+      CAST(NULL AS STRING) AS error_text,
+      CAST(NULL AS STRING) AS solution_text,
+      rt.embedding_description_text AS description_text,
+      rt.embedding_notes_text AS notes_text,
+      CAST(NULL AS STRING) AS confluence_data_text,
+      CAST(NULL AS STRING) AS confluence_contacts_text
+    ) AS base
+  FROM req_scores s
+  JOIN `myproj.mydata.TableIRequests` r ON r.reqId = s.id
+  LEFT JOIN `myproj.mydata.TableIRequestsText` rt ON rt.reqId = s.id
+  WHERE s.n_terms = ARRAY_LENGTH(@terms)
+    AND ( @threshold IS NULL OR s.score >= @threshold )
+),
+
+-- Confluence
+conf_union AS (
+  SELECT 'TableConfluence' AS source_table, base.idConfluence AS id, base.nameConfluence AS name, distance
+  FROM VECTOR_SEARCH(TABLE `myproj.mydata.TableConfluence`, 'embedding_confluence_data',
+    (SELECT emb FROM query_vec), 'emb', top_k => @candidateK, distance_type => 'COSINE', options => '{}')
+  UNION ALL
+  SELECT 'TableConfluence', base.idConfluence, base.nameConfluence, distance
+  FROM VECTOR_SEARCH(TABLE `myproj.mydata.TableConfluence`, 'embedding_confluence_contacts',
+    (SELECT emb FROM query_vec), 'emb', top_k => @candidateK, distance_type => 'COSINE', options => '{}')
+),
+conf_best AS (
+  SELECT source_table, id, name, MIN(distance) AS best_distance
+  FROM conf_union GROUP BY source_table, id, name
+),
+conf_scores AS (
+  SELECT
+    b.source_table, b.id, b.name,
+    1.0 - b.best_distance AS bqScore,
+    MIN( 1.0 - LEAST(
+          COSINE_DISTANCE(t.emb, c.embedding_confluence_data),
+          COSINE_DISTANCE(t.emb, c.embedding_confluence_contacts)
+        ) ) AS score,
+    COUNT(*) AS n_terms
+  FROM conf_best b
+  JOIN `myproj.mydata.TableConfluence` c ON c.idConfluence = b.id
+  CROSS JOIN UNNEST(@terms) AS t
+  GROUP BY b.source_table, b.id, b.name, b.best_distance
+),
+conf_filtered AS (
+  SELECT
+    s.source_table, s.id, s.name, s.score, s.bqScore,
+    STRUCT(
+      CAST(NULL AS STRING) AS incId,
+      CAST(NULL AS STRING) AS incName,
+      CAST(NULL AS STRING) AS reqId,
+      CAST(NULL AS STRING) AS reqName,
+      c.idConfluence, c.nameConfluence,
+      CAST(NULL AS STRING) AS error_text,
+      CAST(NULL AS STRING) AS solution_text,
+      CAST(NULL AS STRING) AS description_text,
+      CAST(NULL AS STRING) AS notes_text,
+      ct.embedding_confluence_data_text AS confluence_data_text,
+      ct.embedding_confluence_contacts_text AS confluence_contacts_text
+    ) AS base
+  FROM conf_scores s
+  JOIN `myproj.mydata.TableConfluence` c ON c.idConfluence = s.id
+  LEFT JOIN `myproj.mydata.TableConfluenceText` ct ON ct.idConfluence = s.id
+  WHERE s.n_terms = ARRAY_LENGTH(@terms)
+    AND ( @threshold IS NULL OR s.score >= @threshold )
+)
+
+SELECT * FROM (
+  SELECT * FROM inc_filtered WHERE @inc
+  UNION ALL SELECT * FROM req_filtered WHERE @req
+  UNION ALL SELECT * FROM conf_filtered WHERE @conf
+)
+ORDER BY score DESC
+LIMIT @topK
+""";
+
+################# SemanticSearchPromptsRequest
+public record SemanticSearchPromptsRequest(
+    List<String> userPrompts,     // includes the initial query as the first element
+    Integer topK,
+    Double scoreThreshold,
+    Boolean searchIncidents,      // default true
+    Boolean searchRequests,       // default true
+    Boolean searchConfluence,     // default true
+    Integer candidateK            // optional; if null uses 10*topK capped to 2000
+) {}
+
+################# TableResult
+TableResult rows = runBigQueryWithPrompts(
+    request.userPrompts(), 
+    Optional.ofNullable(request.topK()).orElse(10),
+    request.scoreThreshold(),
+    request.candidateK(),                             // or null
+    request.searchIncidents() == null ? true : request.searchIncidents(),
+    request.searchRequests()  == null ? true : request.searchRequests(),
+    request.searchConfluence()== null ? true : request.searchConfluence()
+);
+
+############## embedAllNormalized
+private List<List<Double>> embedAllNormalized(List<String> texts) {
+    var res = embeddingModel.embed(texts).getResults();
+    List<List<Double>> out = new ArrayList<>(res.size());
+    for (var e : res) out.add(l2normalize(e.getOutput()));
+    return out;
+}
+
+############## meanNormalize
+private List<Double> meanNormalize(List<List<Double>> vecs) {
+    int d = vecs.get(0).size();
+    double[] sum = new double[d];
+    for (var v : vecs) for (int i = 0; i < d; i++) sum[i] += v.get(i);
+    List<Double> m = new ArrayList<>(d);
+    for (int i = 0; i < d; i++) m.add(sum[i] / vecs.size());
+    return l2normalize(m);
+}
+
+############## buildTermsParam
+private QueryParameterValue buildTermsParam(List<List<Double>> termVecs) {
+    // BigQuery doesn’t allow ARRAY<ARRAY<FLOAT64>>; use ARRAY<STRUCT<emb ARRAY<FLOAT64>>>
+    QueryParameterValue[] structs = new QueryParameterValue[termVecs.size()];
+    for (int i = 0; i < termVecs.size(); i++) {
+        QueryParameterValue embArr =
+            QueryParameterValue.array(termVecs.get(i).toArray(new Double[0]), StandardSQLTypeName.FLOAT64);
+        structs[i] = QueryParameterValue.struct(Map.of("emb", embArr));
+    }
+    return QueryParameterValue.array(structs, StandardSQLTypeName.STRUCT);
+}
+
+################ The unified runner (choose single vs AND)
+
+public TableResult runBigQueryWithPrompts(
+        List<String> userPrompts,
+        int topK,
+        Double threshold,
+        Integer candidateKOpt,
+        boolean searchIncidents,
+        boolean searchRequests,
+        boolean searchConfluence
+) {
+    if (userPrompts == null || userPrompts.isEmpty()) {
+        throw new IllegalArgumentException("userPrompts must contain at least one prompt");
+    }
+
+    // 1) Embed all prompts (normalized)
+    List<List<Double>> termVecs = embedAllNormalized(userPrompts);
+
+    // 2) If only one prompt -> single-term SQL; else -> AND SQL
+    boolean andMode = termVecs.size() > 1;
+
+    // 3) Combined embedding for candidate ANN (used in both modes; harmless for single)
+    List<Double> qComb = meanNormalize(termVecs);
+
+    int candidateK = candidateKOpt != null ? candidateKOpt : Math.min(topK * 10, 2000);
+
+    String sql = andMode ? SQL_AND : SQL_SINGLE;
+
+    Map<String, QueryParameterValue> params = new HashMap<>();
+    params.put("q_comb", QueryParameterValue.array(qComb.toArray(new Double[0]), StandardSQLTypeName.FLOAT64));
+    params.put("topK", QueryParameterValue.int64(topK));
+    params.put("threshold", threshold == null
+            ? QueryParameterValue.nullOf(StandardSQLTypeName.FLOAT64)
+            : QueryParameterValue.float64(threshold));
+    params.put("candidateK", QueryParameterValue.int64(candidateK));
+    params.put("inc", QueryParameterValue.bool(searchIncidents));
+    params.put("req", QueryParameterValue.bool(searchRequests));
+    params.put("conf", QueryParameterValue.bool(searchConfluence));
+
+    if (andMode) {
+        params.put("terms", buildTermsParam(termVecs)); // only needed for AND mode
+    }
+
+    QueryJobConfiguration qjc = QueryJobConfiguration.newBuilder(sql)
+        .setUseLegacySql(false)
+        .setNamedParameters(params)
+        .build();
+
+    JobId jobId = JobId.newBuilder().setLocation(JOB_LOCATION).build(); // us-central1
+    Job job = bigQuery.create(JobInfo.newBuilder(qjc).setJobId(jobId).build());
+    try {
+        job = job.waitFor();
+        if (job == null) throw new RuntimeException("Job disappeared");
+        if (job.getStatus().getError() != null) throw new RuntimeException(job.getStatus().getError().toString());
+        return job.getQueryResults();
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException(e);
+    }
+}
+
+############### Performance
+
+Performance: For AND with many prompts, costs rise linearly with the number of prompts due to UNNEST(@terms). 
+Keep ≤ 8 prompts per call for good latency; if you often exceed that, increase candidateK carefully and consider caching/shortlisting by keywords before ANDing vectors.
+
+-------------------------------------- hard-AND over prompts - end --------------------------------------
+
 
 
