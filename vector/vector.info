@@ -3298,6 +3298,112 @@ LIMIT @topK;
 
 -------------------------------------- CTE holding an array of structs - end  --------------------------------------
 
+-------------------------------------- App resolver (hybrid) SQL - start  --------------------------------------
+
+DECLARE user_query  STRING  DEFAULT @q;
+DECLARE top_k       INT64   DEFAULT @topK;
+
+-- Tuneables
+DECLARE kw_bonus    FLOAT64 DEFAULT 0.06;   -- bonus if SEARCH() hits
+DECLARE exact_bonus FLOAT64 DEFAULT 0.02;   -- extra bonus for exact backtick token
+DECLARE kw_base     FLOAT64 DEFAULT 1.00;   -- baseline for keyword-only rows
+DECLARE cosine_max  FLOAT64 DEFAULT @cosine_max; -- accept dense hits only if distance <= this
+
+-- 1) Dense candidates from app embeddings (oversample a bit)
+WITH v_app AS (
+  SELECT
+    base.app_id,
+    base.app_name,
+    base.app_id_name,
+    vs.distance AS distance
+  FROM VECTOR_SEARCH(
+         TABLE `your_project.your_dataset.app_table`,
+         'ap_id_name_embedding',
+         (SELECT @q_vec AS embedding),
+         top_k => top_k * 3,
+         distance_type => 'COSINE'
+       ) AS vs
+),
+
+-- 2) Keyword candidates from app_id_name (accelerated by your SEARCH index)
+kw_app AS (
+  SELECT
+    a.app_id,
+    a.app_name,
+    a.app_id_name,
+    SEARCH(a.app_id_name, user_query) AS kw_hit,
+    -- If your search index uses LOG_ANALYZER (default), backtick forces exact token match.
+    -- Example: if the query contains APP_1234, you could pass it as `APP_1234` to force exact token. 
+    -- (Behavior documented in SEARCH functions page.)
+    -- Here we just compute a convenient "exact token appears verbatim" boolean too:
+    REGEXP_CONTAINS(LOWER(a.app_id_name), r'\b' || LOWER(user_query) || r'\b') AS exact_hit
+  FROM `your_project.your_dataset.app_table` a
+  WHERE SEARCH(a.app_id_name, user_query)
+),
+
+-- 3) Score dense hits (prefer ones that also have keyword/exact signal)
+dense_scored AS (
+  SELECT
+    d.app_id, d.app_name, d.app_id_name, d.distance,
+    IFNULL(k.kw_hit, FALSE)  AS kw_hit,
+    IFNULL(k.exact_hit, FALSE) AS exact_hit,
+    d.distance
+      - IF(IFNULL(k.kw_hit, FALSE),  kw_bonus,    0.0)
+      - IF(IFNULL(k.exact_hit, FALSE), exact_bonus, 0.0) AS hybrid_score,
+    TRUE  AS from_dense,
+    FALSE AS from_keyword_only
+  FROM v_app d
+  LEFT JOIN kw_app k USING (app_id, app_name, app_id_name)
+  -- Keep only reasonably close dense candidates (guard against loose matches)
+  WHERE d.distance <= cosine_max
+),
+
+-- 4) Add keyword-only candidates not in dense set (so acronyms/IDs can win)
+kw_only AS (
+  SELECT
+    k.app_id, k.app_name, k.app_id_name,
+    NULL AS distance,
+    k.kw_hit, k.exact_hit,
+    kw_base
+      - IF(k.kw_hit,     kw_bonus,    0.0)
+      - IF(k.exact_hit,  exact_bonus, 0.0) AS hybrid_score,
+    FALSE AS from_dense,
+    TRUE  AS from_keyword_only
+  FROM kw_app k
+  LEFT JOIN v_app d USING (app_id, app_name, app_id_name)
+  WHERE d.app_id IS NULL
+),
+
+-- 5) Merge and de-dupe per app_id/app_name (best row per app)
+all_cands AS (
+  SELECT * FROM dense_scored
+  UNION ALL
+  SELECT * FROM kw_only
+),
+dedup AS (
+  SELECT AS VALUE
+    ARRAY_AGG(c ORDER BY hybrid_score ASC LIMIT 1)[OFFSET(0)]
+  FROM all_cands c
+  GROUP BY app_id, app_name
+)
+
+-- Final: top-N app candidates for pre-filtering
+SELECT
+  app_id,
+  app_name,
+  hybrid_score,
+  distance,
+  kw_hit,
+  exact_hit,
+  from_dense,
+  from_keyword_only
+FROM dedup
+ORDER BY hybrid_score ASC
+LIMIT top_k;
+
+
+-------------------------------------- App resolver (hybrid) SQL - end  --------------------------------------
+
 -------------------------------------- Hybrid Search - start  --------------------------------------
 
 CREATE SEARCH INDEX idx_incidents_details
