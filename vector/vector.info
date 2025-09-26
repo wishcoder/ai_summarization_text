@@ -3297,3 +3297,143 @@ ORDER BY s.score DESC
 LIMIT @topK;
 
 -------------------------------------- CTE holding an array of structs - end  --------------------------------------
+
+-------------------------------------- Hybrid Search - start  --------------------------------------
+
+CREATE SEARCH INDEX idx_incidents_details
+ON `your_project.your_dataset.incidents`(details);
+
+
+-- Hybrid dense + keyword retrieval with de-dupe
+DECLARE user_query STRING DEFAULT @q;
+DECLARE top_k      INT64  DEFAULT @topK;
+
+-- Tunable bonuses (smaller is better because cosine distance):
+DECLARE kw_bonus   FLOAT64 DEFAULT 0.08;  -- boost for keyword match
+DECLARE res_bonus  FLOAT64 DEFAULT 0.02;  -- slight preference for resolution hits
+DECLARE kw_base    FLOAT64 DEFAULT 1.00;  -- baseline distance for keyword-only rows
+
+-- 1) Dense candidates from DETAILS
+WITH v_details AS (
+  SELECT
+    base.incident_id,
+    base.app_id,
+    base.app_name,
+    vs.distance AS distance,
+    FALSE AS from_resolution
+  FROM VECTOR_SEARCH(
+         TABLE `your_project.your_dataset.embedding_details`,
+         'embedding',
+         (SELECT @q_vec AS embedding),
+         top_k => top_k,
+         distance_type => 'COSINE'
+       ) AS vs
+),
+
+-- 2) Dense candidates from RESOLUTIONS
+v_resolutions AS (
+  SELECT
+    base.incident_id,
+    base.app_id,
+    base.app_name,
+    vs.distance AS distance,
+    TRUE AS from_resolution
+  FROM VECTOR_SEARCH(
+         TABLE `your_project.your_dataset.embedding_resolutions`,
+         'embedding',
+         (SELECT @q_vec AS embedding),
+         top_k => top_k,
+         distance_type => 'COSINE'
+       ) AS vs
+),
+
+-- 3) Union dense candidates
+dense_union AS (
+  SELECT * FROM v_details
+  UNION ALL
+  SELECT * FROM v_resolutions
+),
+
+-- 4) Keyword candidates (leverages two SEARCH indexes on incidents.details and incidents.resolutions)
+kw_hits AS (
+  SELECT
+    i.incident_id,
+    i.app_id,
+    i.app_name,
+    -- flags per column (both use search indexes you created)
+    SEARCH(i.details,    user_query) AS kw_details,
+    SEARCH(i.resolutions, user_query) AS kw_resolutions
+  FROM `your_project.your_dataset.incidents` AS i
+  WHERE SEARCH(i.details, user_query) OR SEARCH(i.resolutions, user_query)
+),
+
+-- 5) Attach keyword flags to dense set (if present)
+dense_scored AS (
+  SELECT
+    d.incident_id,
+    d.app_id,
+    d.app_name,
+    d.distance,
+    d.from_resolution,
+    IFNULL(k.kw_details, FALSE) AS kw_details,
+    IFNULL(k.kw_resolutions, FALSE) AS kw_resolutions,
+    -- subtract small bonuses when keyword hits or result is from resolutions
+    d.distance
+      - IF(IFNULL(k.kw_details, FALSE) OR IFNULL(k.kw_resolutions, FALSE), kw_bonus, 0.0)
+      - IF(d.from_resolution, res_bonus, 0.0) AS hybrid_score
+  FROM dense_union d
+  LEFT JOIN kw_hits k
+    USING (incident_id, app_id, app_name)
+),
+
+-- 6) Add keyword-only candidates not present in the dense list (so pure token hits can surface)
+kw_only AS (
+  SELECT
+    k.incident_id,
+    k.app_id,
+    k.app_name,
+    NULL AS distance,
+    -- treat as not-from-resolution; (you can refine if you prefer to split)
+    FALSE AS from_resolution,
+    k.kw_details,
+    k.kw_resolutions,
+    -- start from a baseline distance and apply the keyword bonus
+    kw_base
+      - IF(k.kw_details OR k.kw_resolutions, kw_bonus, 0.0) AS hybrid_score
+  FROM kw_hits k
+  LEFT JOIN dense_union d
+    USING (incident_id, app_id, app_name)
+  WHERE d.incident_id IS NULL
+),
+
+-- 7) Merge dense and keyword-only
+all_candidates AS (
+  SELECT * FROM dense_scored
+  UNION ALL
+  SELECT * FROM kw_only
+),
+
+-- 8) De-duplicate on (incident_id, app_id, app_name) keeping the best hybrid_score
+dedup AS (
+  SELECT AS VALUE
+    ARRAY_AGG(c ORDER BY hybrid_score ASC LIMIT 1)[OFFSET(0)]
+  FROM all_candidates c
+  GROUP BY incident_id, app_id, app_name
+)
+
+-- Final results
+SELECT
+  incident_id,
+  app_id,
+  app_name,
+  hybrid_score,
+  distance,               -- may be NULL for keyword-only candidates
+  kw_details,
+  kw_resolutions,
+  from_resolution
+FROM dedup
+ORDER BY hybrid_score ASC
+LIMIT top_k;
+
+
+-------------------------------------- Hybrid Search - end  --------------------------------------
