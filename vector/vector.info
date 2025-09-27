@@ -3821,6 +3821,50 @@ Instructions:
 
 -------------------------------------- Prompt - end  --------------------------------------
 
+-------------------------------------- Pre-filtering - start  --------------------------------------
+
+CREATE SEARCH INDEX idx_app_detail
+ON `proj.ds.app_record`(app_detail);
+
+------
+
+WITH lex AS (
+  SELECT app_id, app_detail, score AS bm25_score
+  FROM SEARCH(`proj.ds.app_record`, app_detail, @raw_query)
+  LIMIT 50
+),
+vec AS (
+  SELECT app_id, app_detail, distance
+  FROM VECTOR_SEARCH(TABLE `proj.ds.app_record`, 'app_detail_embedding', @query_vec, STRUCT(50 AS top_k))
+),
+merged AS (
+  SELECT
+    COALESCE(lex.app_id, vec.app_id) AS app_id,
+    COALESCE(lex.app_detail, vec.app_detail) AS app_detail,
+    -- convert distance to similarity (simple, because smaller distance = better)
+    IFNULL(1.0 / (1.0 + vec.distance), 0.0) AS vector_score,
+    IFNULL(lex.bm25_score, 0.0) AS bm25_score,
+    -- boosts with no alias table
+    CASE
+      WHEN LOWER(@raw_query) = LOWER(COALESCE(lex.app_detail, vec.app_detail)) THEN 1.0
+      WHEN STARTS_WITH(LOWER(COALESCE(lex.app_detail, vec.app_detail)), LOWER(@raw_query)) THEN 0.5
+      ELSE 0.0
+    END AS match_boost,
+    REGEXP_CONTAINS(@raw_query, r'(?i)\bAPP-\d+\b') AND
+    REGEXP_EXTRACT(@raw_query, r'(?i)\bAPP-\d+\b') = COALESCE(lex.app_id, vec.app_id) AS app_id_hit
+  FROM lex
+  FULL JOIN vec USING (app_id, app_detail)
+)
+SELECT
+  app_id, app_detail,
+  0.6*vector_score + 0.3*bm25_score + 0.1*IF(app_id_hit, 1.0, match_boost) AS final_score
+FROM merged
+ORDER BY final_score DESC
+LIMIT 10;
+
+
+-------------------------------------- Pre-filtering - end  --------------------------------------
+
 
 
 
