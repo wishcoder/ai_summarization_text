@@ -3543,3 +3543,287 @@ LIMIT top_k;
 
 
 -------------------------------------- Hybrid Search - end  --------------------------------------
+
+-------------------------------------- Example: Creating an index for high recall - start  --------------------------------------
+
+CREATE OR REPLACE VECTOR INDEX my_vector_index
+ON my_project.my_dataset.confluence_embeddings_table(embedding_column)
+OPTIONS(
+  distance_type='COSINE',
+  ivf_options => '{ "num_lists": 5000 }'
+);
+
+----------------
+
+SELECT
+  confluence_page_id,
+  distance
+FROM
+  VECTOR_SEARCH(
+    TABLE my_project.my_dataset.confluence_embeddings_table,
+    'embedding_column',
+    (SELECT ml_generate_embedding_result FROM ML.GENERATE_EMBEDDING(
+      MODEL my_project.my_dataset.gemini_embedding_model,
+      (SELECT 'Your user search query goes here' AS content)
+    )),
+    top_k => 5,
+    distance_type => 'COSINE',
+    options => '{"fraction_lists_to_search": 0.1}'
+  )
+ORDER BY
+  distance ASC;
+
+----------------
+
+SELECT
+  confluence_page_id,
+  ML.GENERATE_EMBEDDING(
+    MODEL my_project.my_dataset.gemini_embedding_model,
+    (SELECT content FROM my_project.my_dataset.confluence_data WHERE confluence_page_id = 123),
+    STRUCT('RETRIEVAL_DOCUMENT' AS task_type)
+  ) AS embedding_result
+FROM
+  my_project.my_dataset.confluence_data;
+
+----------------
+
+SELECT
+  base.confluence_page_title,
+  distance
+FROM
+  VECTOR_SEARCH(
+    TABLE my_project.my_dataset.confluence_embeddings_table,
+    'embedding_column',
+    (SELECT ml_generate_embedding_result FROM ML.GENERATE_EMBEDDING(
+      MODEL my_project.my_dataset.gemini_embedding_model,
+      (SELECT 'What is our corporate travel policy?' AS content),
+      STRUCT('RETRIEVAL_QUERY' AS task_type)
+    )),
+    top_k => 5,
+    distance_type => 'COSINE'
+  )
+ORDER BY
+  distance ASC;
+
+----------------
+
+CREATE OR REPLACE TABLE my_project.my_dataset.confluence_embeddings_table AS
+SELECT
+  confluence_page_id,
+  ml_generate_embedding_result.embedding_value AS embedding_column
+FROM
+  ML.GENERATE_EMBEDDING(
+    MODEL my_project.my_dataset.gemini_embedding_model,
+    (
+      SELECT
+        confluence_page_id,
+        content AS content
+      FROM
+        my_project.my_dataset.confluence_data
+    ),
+    STRUCT(
+      'RETRIEVAL_DOCUMENT' AS task_type,
+      1536 AS output_dimensionality
+    )
+  );
+
+----------------
+You are an expert assistant for a Confluence knowledge base.
+Answer the following question based ONLY on the context provided.
+Do not use any prior knowledge. If the answer is not in the context, say so.
+
+Context:
+[Text from retrieved Confluence Page #1]
+[Text from retrieved Confluence Page #2]
+[Text from retrieved Confluence Page #3]
+...
+
+Question:
+[The user's query]
+
+Answer:
+
+Call the LLM to generate the answer
+
+SELECT
+  ml_generate_text_result FROM ML.GENERATE_TEXT(
+  MODEL my_project.my_dataset.gemini_text_model,
+  (SELECT 'Your augmented prompt goes here' AS prompt)
+);
+
+-------------------------------------- Example: Creating an index for high recall - end  --------------------------------------
+
+-------------------------------------- Prompt - start  --------------------------------------
+
+=> System prompt
+You are an enterprise incident investigation assistant.  
+Always follow this reasoning priority when analyzing retrieved context:  
+1. Change Deployment System (ChangeId, AppId, ChangeType, ChangeDate)  
+2. Incident Management System (IncidentId, IncidentDetail, IncidentDate, AppId?)  
+3. Confluence SOP (AppId, error details, resolution steps)  
+
+Rules:
+- Do not invent IDs, applications, or resolutions.  
+- Always ground responses in retrieved context only.  
+- If a recent Change is related to the query or AppId, treat it as the most likely root cause.  
+- If an Incident matches but no related Change is found, summarize the incident facts.  
+- If SOP content matches, include standard resolution steps.  
+- Prefer concise, factual answers.  
+- Always include traceability (IDs, dates, impacted AppIds).  
+- If nothing relevant is found, answer: “No relevant results found.”  
+
+----------------
+
+=> Aanalyzing enterprise incidents.  
+Always check Change Deployment System data first, then Incident records, then Confluence SOPs.  
+
+User query: "{user_query}"  
+
+Retrieved context:
+[Change Deployment Data]  
+{retrieved_changes}  
+
+[Incident Data]  
+{retrieved_incidents}  
+
+[Confluence SOP Data]  
+{retrieved_sop}  
+
+Instructions:
+- If a recent change matches the query or AppId, treat it as the primary candidate root cause.  
+- Link related incidents to this change if timelines align.  
+- If no relevant change is found, summarize based on incident history.  
+- If SOP guidance is relevant, include possible resolution steps.  
+- Output in this structure:  
+  • Potential Root Cause (from Change/Incident/SOP)  
+  • Supporting Evidence (ChangeId/IncidentId/AppId)  
+  • Resolution Steps (from SOP or Incident notes)  
+
+----------------
+
+=> Correlating changes and incidents.  
+
+Query: "{user_query}"  
+
+Retrieved context:
+[Change Deployment Data]  
+{retrieved_changes}  
+
+[Incident Data]  
+{retrieved_incidents}  
+
+Instructions:
+- Identify if incidents occurred within 24 hours of a change.  
+- List correlated pairs as:  
+  ChangeId – ChangeType – ChangeDate  
+    ↳ Related IncidentId – IncidentDetail – IncidentDate  
+- If no correlation exists, state "No temporal correlation found."  
+
+
+----------------
+
+=> Generating resolution guidance.  
+
+Query: "{user_query}"  
+
+Context:
+[Incident Data]  
+{retrieved_incidents}  
+
+[Confluence SOPs]  
+{retrieved_sop}  
+
+Instructions:
+- Match the query and/or incident error against SOP error patterns.  
+- Suggest standard resolution steps if available.  
+- If multiple SOPs match, list them in order of relevance.  
+- Output format:  
+  • IncidentId – Error Summary  
+  • Matching SOP – Resolution Steps  
+
+----------------
+
+=> Build a timeline of related events for: "{user_query}"  
+
+Retrieved context:
+[Change Deployment Data]  
+{retrieved_changes}  
+
+[Incident Data]  
+{retrieved_incidents}  
+
+[Confluence SOPs]  
+{retrieved_sop}  
+
+Instructions:
+- Place events chronologically (Change → Incident → SOP).  
+- Show chain of cause → failure → resolution.  
+- Include timestamps and IDs for traceability.  
+- End with total outage duration (if derivable).  
+
+----------------
+
+=> Find similar past incidents and related changes for: "{user_query}"  
+
+Context:
+[Change Deployment Data]  
+{retrieved_changes}  
+
+[Incident Data]  
+{retrieved_incidents}  
+
+Instructions:
+- Pick top 3 similar incidents.  
+- For each, check if a change was applied near the incident.  
+- Output as:  
+  1) IncidentId – Detail – Resolution  
+     ↳ Related ChangeId – ChangeType – ChangeDate  
+  2) …  
+
+----------------
+
+=> Draft a postmortem summary for query: "{user_query}"  
+
+Retrieved data:
+[Change Deployment] {retrieved_changes}  
+[Incident Management] {retrieved_incidents}  
+[Confluence SOP] {retrieved_sop}  
+
+Instructions:
+- Include:  
+  • Summary of what happened (Change/Incident details).  
+  • Why it happened (change error, infra issue, etc.).  
+  • How it was resolved (from Incident notes or SOP).  
+  • Impacted applications/customers (from AppId).  
+  • Duration and MTTR (if available).  
+- Keep language factual and reference IncidentId/ChangeId.  
+
+----------------
+
+=> Returning machine-readable structured output.  
+
+User query: "{user_query}"  
+Retrieved context:  
+{retrieved_changes}  
+{retrieved_incidents}  
+{retrieved_sop}  
+
+Instructions:
+- Output ONLY in JSON format with fields:  
+{
+  "root_cause": "...",
+  "related_changes": [ { "changeId": "...", "appId": "...", "type": "...", "date": "..." } ],
+  "related_incidents": [ { "incidentId": "...", "detail": "...", "date": "..." } ],
+  "resolution_steps": [ "..." ],
+  "sop_links": [ "..." ]
+}
+
+
+-------------------------------------- Prompt - end  --------------------------------------
+
+
+
+
+
+
+
