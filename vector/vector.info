@@ -3865,9 +3865,143 @@ LIMIT 10;
 
 -------------------------------------- Pre-filtering - end  --------------------------------------
 
+-------------------------------------- UI with seperate section - start  --------------------------------------
+
+// types.ts
+export type EscRow = { col1: string; col2: string; col3: string; col4: string };
+
+export type BackendResponse = {
+  CRQ?: Array<{ summary: string; escalation?: EscRow[] }>;
+  INC?: Array<{ summary: string }>;
+  SOP?: Array<{ summary: string }>;
+};
+
+// chat messages union
+export type Message =
+  | { id: string; role: 'user'; text: string }
+  | { id: string; role: 'bot'; kind: 'summary'; payload: BackendResponse }
+  | { id: string; role: 'bot'; kind: 'crq-detail'; summary: string; rows: EscRow[] };
 
 
+-------------
+ChatBubbleUser.vue
+
+<template>
+  <div class="flex justify-end my-3">
+    <v-sheet class="rounded-xl px-4 py-3 bg-primary text-white max-w-[85%]">
+      {{ text }}
+    </v-sheet>
+  </div>
+</template>
+
+<script setup lang="ts">
+defineProps<{ text: string }>()
+</script>
 
 
+-----------
+ChatThread.vue (parent with messages array)
 
+<template>
+  <v-container class="max-w-screen-md">
+    <!-- FEED -->
+    <div class="py-4">
+      <component
+        v-for="m in messages"
+        :key="m.id"
+        :is="resolveComp(m)"
+        v-bind="resolveProps(m)"
+        @token-click="onTokenClick"
+        @escalation-click="onEscalationClick"
+      />
+    </div>
 
+    <!-- INPUT (example) -->
+    <v-form @submit.prevent="send">
+      <v-text-field
+        v-model="draft"
+        label="Type a message"
+        density="comfortable"
+        clearable
+        hide-details
+      />
+      <div class="flex gap-2">
+        <v-btn color="primary" @click="send">Send</v-btn>
+        <v-btn variant="text" @click="loadMockBot">Load mock bot payload</v-btn>
+      </div>
+    </v-form>
+  </v-container>
+</template>
+
+<script setup lang="ts">
+import { ref } from 'vue'
+import { nanoid } from 'nanoid'
+import ChatBubbleUser from './ChatBubbleUser.vue'
+import ChatBubbleBot from './ChatBubbleBot.vue'
+import ChatBubbleCrqDetail from './ChatBubbleCrqDetail.vue'
+import type { Message, BackendResponse, EscRow } from './types'
+
+const messages = ref<Message[]>([])
+const draft = ref('')
+
+// ---- demo: mock payload from backend ----
+const mockPayload: BackendResponse = {
+  CRQ: [
+    {
+      summary: 'CRQ $$$CRQ12345$$$ relates to $$$COML789$$$; owner $$$U123$$$',
+      escalation: [
+        { col1: 'COML789', col2: 'Pending', col3: 'High', col4: 'Ops' },
+        { col1: 'COML790', col2: 'Approved', col3: 'Low',  col4: 'NOC' }
+      ]
+    }
+  ],
+  INC: [{ summary: 'INC $$$INC1234x$$$ resolved via kernel param tweak' }],
+  SOP: [{ summary: 'SOP $$$SOPAPP-DB01$$$ covers connection pooling' }]
+}
+
+// ---- helpers to render any message ----
+function resolveComp(m: Message) {
+  if (m.role === 'user') return ChatBubbleUser
+  if (m.kind === 'summary') return ChatBubbleBot
+  return ChatBubbleCrqDetail
+}
+function resolveProps(m: Message) {
+  if (m.role === 'user') return { text: m.text }
+  if (m.kind === 'summary') return { payload: m.payload }
+  return { summary: m.summary, rows: m.rows }
+}
+
+// ---- event handlers coming from child bubbles ----
+function onTokenClick(e: { value: string; type: 'CRQ'|'INC'|'SOP' }) {
+  // 👉 call your real handler here:
+  // e.value is the value inside $$$...$$$
+  // e.type is which section it came from
+  console.log('token-click', e)
+  // Example: emit to parent app or route, or call a composable
+}
+
+function onEscalationClick(e: { rows: EscRow[]; summary: string }) {
+  // Append a new CRQ detail bubble (summary + table), as a new chat message
+  messages.value.push({
+    id: nanoid(),
+    role: 'bot',
+    kind: 'crq-detail',
+    rows: e.rows,
+    summary: e.summary
+  })
+}
+
+// ---- input actions ----
+function send() {
+  if (!draft.value?.trim()) return
+  messages.value.push({ id: nanoid(), role: 'user', text: draft.value.trim() })
+  draft.value = ''
+  // In your real app, call backend then push a 'summary' bot message with its payload.
+}
+
+function loadMockBot() {
+  messages.value.push({ id: nanoid(), role: 'bot', kind: 'summary', payload: mockPayload })
+}
+</script>
+
+-------------------------------------- UI with seperate section - start  --------------------------------------
